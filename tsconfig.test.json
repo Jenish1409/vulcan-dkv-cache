@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Tests don't get emitted — no rootDir/outDir restriction needed.
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}

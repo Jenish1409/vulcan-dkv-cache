@@ -1,0 +1,31 @@
+{
+  "name": "vulcan",
+  "version": "1.0.0",
+  "description": "Distributed key-value cache with consistent hashing, replication, and chaos-testing.",
+  "main": "dist/store/index.js",
+  "types": "dist/store/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jenish1409/vulcan-dkv-cache.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Jenish1409/vulcan-dkv-cache/issues"
+  },
+  "homepage": "https://github.com/Jenish1409/vulcan-dkv-cache#readme",
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.4.1",
+    "jest": "^30.5.1",
+    "ts-jest": "^29.4.12",
+    "typescript": "^5.9.3"
+  }
+}
