@@ -130,11 +130,13 @@ Tests use **Jest fake timers** (`jest.useFakeTimers()`) so TTL expiry tests run 
 |---------|-------|
 | ~~Network protocol (TCP/gRPC)~~ | ~~Phase 2~~ ✅ Done |
 | ~~Consistent hashing ring~~ | ~~Phase 2~~ ✅ Done |
-| Replication / quorum | Phase 3 |
-| Dynamic node discovery (gossip) | Phase 3 |
-| Persistence (WAL / snapshots) | Phase 4+ |
-| Chaos testing | Phase 5+ |
-| Docker / deployment | Phase 6+ |
+| ~~Heartbeat / failure detection~~ | ~~Phase 3~~ ✅ Done |
+| ~~Ring recovery on node failure~~ | ~~Phase 3~~ ✅ Done |
+| Replication / quorum | Phase 4 |
+| Dynamic node discovery (gossip) | Phase 4 |
+| Persistence (WAL / snapshots) | Phase 5+ |
+| Chaos testing | Phase 6+ |
+| Docker / deployment | Phase 7+ |
 
 The `LRUCache` class is intentionally self-contained and import-friendly — the Phase 2 HTTP layer wraps it without modifying a single line.
 
