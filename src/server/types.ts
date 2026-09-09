@@ -1,9 +1,8 @@
 /**
- * Shared TypeScript interfaces for Vulcan Phase 2 server layer.
+ * Shared TypeScript interfaces for Vulcan Phase 2 + 3 server layer.
  *
- * Kept in a dedicated file so `node.ts`, `router.ts`, and any future
- * modules (replication, health-check daemon) can import without circular
- * dependencies.
+ * Kept in a dedicated file so `node.ts`, `router.ts`, `HeartbeatManager.ts`,
+ * and any future modules can import without circular dependencies.
  */
 
 // ---------------------------------------------------------------------------
@@ -62,12 +61,36 @@ export interface KVMutateResponse {
   handledBy: string;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3 — Cluster health view
+// ---------------------------------------------------------------------------
+
+/**
+ * This node's current belief about one peer's liveness.
+ *
+ * Populated by HeartbeatManager and included in the /health response so
+ * cluster state is observable via HTTP without reading log files.
+ */
+export interface PeerHealth {
+  nodeId: string;
+  host: string;
+  port: number;
+  /** Current liveness state as seen by THIS node. */
+  status: "ALIVE" | "DEAD";
+  /**
+   * Unix-ms timestamp of the last successful health-check response.
+   * null means the node has not been seen since this process started.
+   */
+  lastSeenMs: number | null;
+  /** Number of consecutive failed health checks (resets to 0 on any success). */
+  consecutiveFailures: number;
+}
+
 /**
  * Response body for `GET /health`.
  *
  * Designed to be **easily extended** in later phases:
- * - Phase 3: add `replicationLag`, `peerStatuses`
- * - Phase 4+: add `ringPosition`, `vnodeCount`
+ * - Phase 4+: add `replicationLag`, `ringPosition`, `vnodeCount`
  *
  * The `status` field is intentionally a union so future states like
  * `"degraded"` or `"recovering"` can be added without a breaking change.
@@ -79,8 +102,14 @@ export interface HealthResponse {
   uptime: number;
   /** Current number of live keys in this node's local cache. */
   keyCount: number;
-  /** Logical cluster peers this node knows about. */
+  /** Logical cluster peers this node knows about (human-readable strings). */
   peers: string[];
+  /**
+   * This node's current view of every peer's liveness status.
+   * Self is always included with status "ALIVE".
+   * Added in Phase 3.
+   */
+  clusterView: PeerHealth[];
   /**
    * "ok" = fully operational.
    * Future phases may add "degraded" | "recovering" | "unreachable".

@@ -1,5 +1,5 @@
 /**
- * node.ts — Vulcan Phase 2: Per-node HTTP server.
+ * node.ts — Vulcan Phase 2 + 3: Per-node HTTP server with heartbeat.
  *
  * Each instance of this process is ONE node in the Vulcan cluster.
  * It owns:
@@ -7,15 +7,17 @@
  *      responsible for according to the consistent hash ring.
  *   2. A HashRing — used by EVERY node to deterministically route any
  *      key to its correct owner, with no central coordinator.
- *   3. An Express HTTP server — handles client requests and forwards
+ *   3. A HeartbeatManager (Phase 3) — periodically pings peers, marks them
+ *      DEAD/ALIVE, and keeps the local ring in sync automatically.
+ *   4. An Express HTTP server — handles client requests and forwards
  *      to peer nodes when the current node isn't the owner.
  *
  * ─── Architecture note ───────────────────────────────────────────────
  * This uses the "every node is a router" pattern rather than a
  * dedicated coordinator.  Trade-off: each non-owner request costs one
  * extra hop (client→any-node→owner-node), but there is no single point
- * of failure.  Replication in Phase 3 will make any node able to serve
- * reads directly, eliminating even that extra hop.
+ * of failure.  Phase 4 replication will allow reads from any replica,
+ * eliminating the extra hop.
  *
  * ─── Startup ─────────────────────────────────────────────────────────
  * Required environment variables:
@@ -25,8 +27,11 @@
  *               "node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"
  *
  * Optional:
- *   MAX_CAPACITY     — LRUCache max keys per node  (default: 10000)
- *   SWEEP_INTERVAL   — active-expiry sweep interval ms (default: 5000)
+ *   MAX_CAPACITY      — LRUCache max keys per node  (default: 10000)
+ *   SWEEP_INTERVAL    — active-expiry sweep interval ms (default: 5000)
+ *   HEARTBEAT_INTERVAL_MS  — how often to ping peers (default: 2000)
+ *   PING_TIMEOUT_MS        — per-ping HTTP timeout (default: 1500)
+ *   FAILURE_THRESHOLD      — consecutive misses before DEAD (default: 3)
  *
  * Example (PowerShell):
  *   $env:NODE_ID="node1"; $env:PORT="5001"; $env:PEERS="node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"; npm run start:node
@@ -36,12 +41,14 @@ import express, { type Request, type Response, type NextFunction } from "express
 import { LRUCache } from "../store";
 import { HashRing } from "../routing/HashRing";
 import { forwardRequest } from "./router";
+import { HeartbeatManager, DEFAULT_HEARTBEAT_CONFIG } from "./HeartbeatManager";
 import type {
   NodeConfig,
   KVSetBody,
   KVGetResponse,
   KVMutateResponse,
   HealthResponse,
+  PeerHealth,
 } from "./types";
 
 /** Typed route params for `/kv/:key` routes. */
@@ -57,6 +64,15 @@ const NODE_ID = process.env["NODE_ID"] ?? "node1";
 const PORT = parseInt(process.env["PORT"] ?? "5001", 10);
 const MAX_CAPACITY = parseInt(process.env["MAX_CAPACITY"] ?? "10000", 10);
 const SWEEP_INTERVAL_MS = parseInt(process.env["SWEEP_INTERVAL"] ?? "5000", 10);
+const HEARTBEAT_INTERVAL_MS = parseInt(
+  process.env["HEARTBEAT_INTERVAL_MS"] ?? String(DEFAULT_HEARTBEAT_CONFIG.intervalMs), 10
+);
+const PING_TIMEOUT_MS = parseInt(
+  process.env["PING_TIMEOUT_MS"] ?? String(DEFAULT_HEARTBEAT_CONFIG.timeoutMs), 10
+);
+const FAILURE_THRESHOLD = parseInt(
+  process.env["FAILURE_THRESHOLD"] ?? String(DEFAULT_HEARTBEAT_CONFIG.failureThreshold), 10
+);
 
 /**
  * Parse PEERS env var into structured NodeConfig objects.
@@ -94,6 +110,17 @@ if (!nodeMap.has(NODE_ID)) {
     `NODE_ID "${NODE_ID}" is not listed in PEERS. Add it to the PEERS env var.`
   );
 }
+
+// Non-self peers — the heartbeat manager only pings these.
+const remotePeers = peers.filter((p) => p.id !== NODE_ID);
+
+/** Phase 3: monitors peer liveness and keeps `ring` in sync. */
+const heartbeat = new HeartbeatManager(
+  NODE_ID,
+  remotePeers,
+  ring,
+  { intervalMs: HEARTBEAT_INTERVAL_MS, timeoutMs: PING_TIMEOUT_MS, failureThreshold: FAILURE_THRESHOLD }
+);
 
 // ---------------------------------------------------------------------------
 // Cache setup
@@ -141,20 +168,52 @@ function isSelf(node: NodeConfig): boolean {
 /**
  * GET /health
  *
- * Returns lightweight status information about this node.
- * Designed to be extended in Phase 3 for heartbeat / health-check logic —
- * just add fields to the HealthResponse interface in types.ts.
+ * Returns this node's status AND its current view of every peer's
+ * liveness (Phase 3 addition).  The `clusterView` array lets operators
+ * observe cluster health via HTTP without reading server logs.
  */
 app.get("/health", (_req: Request, res: Response) => {
+  // Build clusterView: self (always ALIVE) + all tracked peers.
+  const selfEntry: PeerHealth = {
+    nodeId: NODE_ID,
+    host: "localhost",
+    port: PORT,
+    status: "ALIVE",
+    lastSeenMs: Date.now(),
+    consecutiveFailures: 0,
+  };
+
   const body: HealthResponse = {
     nodeId: NODE_ID,
     port: PORT,
     uptime: Math.floor((Date.now() - startTime) / 1000),
     keyCount: cache.size,
     peers: peers.map((p) => `${p.id}@${p.host}:${p.port}`),
+    clusterView: [selfEntry, ...heartbeat.getPeerStatuses()],
     status: "ok",
   };
   res.json(body);
+});
+
+/**
+ * GET /ring/owner/:key
+ *
+ * Debug endpoint: returns which node WOULD own this key according to the
+ * current local ring, WITHOUT storing anything.  Useful for pre-probing
+ * key ownership before writes (e.g. failure-test.ps1 uses this to
+ * identify which keys hash to each node before killing one).
+ *
+ * Returns 503 if the ring is empty (all nodes dead).
+ */
+app.get("/ring/owner/:key", (req: Request<KVParams>, res: Response) => {
+  try {
+    const { key } = req.params;
+    const owner = ownerOf(key);
+    res.json({ key, owner: owner.id, ringSize: ring.size });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(503).json({ error: "Ring unavailable.", detail: msg });
+  }
 });
 
 /**
@@ -265,7 +324,12 @@ const server = app.listen(PORT, () => {
   console.log(`[${NODE_ID}]   Listening on  : http://localhost:${PORT}`);
   console.log(`[${NODE_ID}]   Cluster peers : ${peers.map((p) => `${p.id}@${p.host}:${p.port}`).join(", ")}`);
   console.log(`[${NODE_ID}]   Cache capacity: ${MAX_CAPACITY} keys`);
-  console.log(`[${NODE_ID}]   Sweep interval: ${SWEEP_INTERVAL_MS}ms\n`);
+  console.log(`[${NODE_ID}]   Sweep interval: ${SWEEP_INTERVAL_MS}ms`);
+  console.log(`[${NODE_ID}]   Heartbeat     : every ${HEARTBEAT_INTERVAL_MS}ms, timeout ${PING_TIMEOUT_MS}ms, threshold ${FAILURE_THRESHOLD}\n`);
+
+  // Start heartbeat AFTER the server is listening so that other nodes
+  // can already health-check US by the time we start checking them.
+  heartbeat.start();
 });
 
 // ---------------------------------------------------------------------------
@@ -274,7 +338,8 @@ const server = app.listen(PORT, () => {
 
 function shutdown(signal: string): void {
   console.log(`\n[${NODE_ID}] Received ${signal} — shutting down gracefully…`);
-  cache.destroy(); // stop the TTL sweep timer
+  heartbeat.stop();  // stop pinging peers
+  cache.destroy();   // stop the TTL sweep timer
   server.close(() => {
     console.log(`[${NODE_ID}] HTTP server closed.`);
     process.exit(0);
