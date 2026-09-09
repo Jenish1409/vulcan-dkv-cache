@@ -244,6 +244,115 @@ Invoke-RestMethod -Uri 'http://localhost:5003/kv/hello'
 #### Run all tests
 
 ```bash
-npm test          # 27 (Phase 1) + 13 (Phase 2 HashRing) = 40 tests
+npm test          # 27 (Phase 1) + 17 (Phase 2 HashRing) = 44 tests
 npm run build     # TypeScript compiles with no errors
 ```
+
+---
+
+## Phase 3 — Heartbeat, Failure Detection & Ring Recovery
+
+### What it does
+
+| Feature | Detail |
+|---|---|
+| **Heartbeat** | Each node pings every peer via `GET /health` every 2 s |
+| **Failure detection** | 3 consecutive missed pings → peer marked DEAD, removed from local ring |
+| **Automatic rerouting** | Once a node is removed from the ring, its key range falls to the next clockwise node — no extra code needed, `HashRing.removeNode()` handles it |
+| **Rejoin handling** | First successful ping after DEAD → peer re-added to ring, logged clearly |
+| **Observable state** | `GET /health` now includes `clusterView` — per-peer ALIVE/DEAD status readable over HTTP |
+| **Ring owner debug** | `GET /ring/owner/:key` — returns predicted owner without storing anything |
+
+---
+
+### Heartbeat Config Values
+
+| Setting | Default | Rationale |
+|---|---|---|
+| `HEARTBEAT_INTERVAL_MS` | **2 000 ms** | Fast enough for ~6 s detection; slow enough not to flood peers |
+| `PING_TIMEOUT_MS` | **1 500 ms** | Shorter than interval so pings don't pile up. 500 ms slack per cycle |
+| `FAILURE_THRESHOLD` | **3 consecutive failures** | 3 × 2 s = **6 s** to declare dead. Absorbs 2 transient packet losses before acting. Production Cassandra uses ~10 s; 6 s fits a dev cluster |
+
+All three are overridable via environment variables.
+
+---
+
+### "Each node has its own local view" — what that means
+
+There is **no distributed consensus** on cluster membership. Each node runs its own heartbeat loop independently and maintains its own copy of the ring.
+
+**Convergence window**: if node1 detects node2 dead 2 s before node3 does, during that ~2 s window they briefly disagree on ring topology. The worst case is one forwarded request bounces off the dead node and returns a 502 — the client retries and succeeds once all nodes converge.
+
+**Why this is acceptable at this stage**: Forcing agreement would require Raft or Paxos — a significant complexity jump that belongs in a later phase. The window is bounded to ≤ 1 heartbeat interval and resolves automatically. This is the same trade-off production gossip protocols (Cassandra, Consul) make — they call it *eventual consistency of cluster membership*.
+
+---
+
+### Architecture: `processPingResult` as the testable unit
+
+`HeartbeatManager` separates network I/O from state-machine logic:
+- `tick()` — runs on the interval, calls `pingFn(peer)` in parallel
+- `processPingResult(nodeId, alive)` — **public, synchronous** state machine; takes a pre-computed boolean
+
+This means unit tests call `processPingResult` directly — no HTTP servers, no fake timers, no mocks of axios. The `pingFn` is injected and replaced with a stub in tests.
+
+---
+
+### Running the failure demo
+
+```powershell
+# Self-contained — starts its own cluster, runs all 12 steps, cleans up
+.\scripts\failure-test.ps1
+```
+
+What it proves (with real terminal output):
+1. All 3 nodes start ALIVE
+2. Keys are discovered on node2 using `GET /ring/owner/:key` (no guessing)
+3. Those keys are written and confirmed `handledBy: node2`
+4. node2 is killed
+5. After ~6 s: node1 and node3 both show node2 as `DEAD` in `/health`
+6. The same keys return `404` — **data is gone, as expected** (no replication yet)
+7. Writing those keys again routes them to node1/node3 — **rerouting confirmed**
+8. node2 is restarted; after ~6 s both surviving nodes show it `ALIVE` again
+9. node2 rejoins empty — data written during the outage stays on node1/node3
+
+#### Live results from an actual run
+
+```
+Ring ownership (100 keys via /ring/owner/:key):
+  node1: 36  |  node2: 29  |  node3: 35
+
+After killing node2 and waiting 10s:
+  port 5001 sees node2 as: DEAD  (consecutiveFailures=8)
+  port 5003 sees node2 as: DEAD  (consecutiveFailures=8)
+
+Data on dead node (404 as expected):
+  probe-key-0, probe-key-1, probe-key-5, probe-key-6, probe-key-9 -> all 404
+
+New writes rerouted:
+  probe-key-0 -> node1  |  probe-key-1 -> node3
+  probe-key-5 -> node3  |  probe-key-6 -> node1  |  probe-key-9 -> node3
+
+After restarting node2:
+  port 5001 sees node2 as: ALIVE
+  port 5003 sees node2 as: ALIVE
+
+Results: 35 passed, 0 failed
+```
+
+#### Run all tests
+
+```bash
+npm test          # 44 (Phase 1+2) + 19 (Phase 3) = 63 tests
+npm run build     # TypeScript compiles with no errors
+```
+
+---
+
+### What's deferred to Phase 4+
+
+| Feature | Why deferred |
+|---|---|
+| Data recovery on rejoin | node2 comes back empty — requires replication to restore its key range |
+| Keys migrated back to node2 | Needs gossip / data migration |
+| Consensus on cluster membership | Raft/Paxos — out of scope for Phase 3 |
+| Docker / chaos harness | Phase 5+ |
