@@ -1,0 +1,31 @@
+# Build context exclusions for Vulcan Docker builds.
+# Keep the build context lean: only what the Dockerfile actually COPYs
+# (package*.json, tsconfig.json, src/) needs to reach the daemon.
+
+# Node modules -- always reinstalled fresh inside the image by npm ci.
+node_modules/
+
+# Compiled output -- rebuilt inside the builder stage by tsc.
+dist/
+
+# Version control
+.git/
+.gitignore
+
+# Test infrastructure -- not needed in the image at all.
+tests/
+jest.config.ts
+tsconfig.test.json
+
+# Developer scripts -- not needed in the image.
+scripts/
+
+# Documentation and assets
+*.md
+docs/
+
+# IDE / OS artefacts
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db

@@ -134,10 +134,10 @@ Tests use **Jest fake timers** (`jest.useFakeTimers()`) so TTL expiry tests run 
 | ~~Ring recovery on node failure~~ | ~~Phase 3~~ ✅ Done |
 | ~~Replication / read fallback~~ | ~~Phase 4~~ ✅ Done |
 | ~~Rejoin re-sync~~ | ~~Phase 4~~ ✅ Done |
-| Dynamic node discovery (gossip) | Phase 5+ |
-| Persistence (WAL / snapshots) | Phase 5+ |
-| Chaos testing | Phase 6+ |
-| Docker / deployment | Phase 7+ |
+| ~~Docker / containerised deployment~~ | ~~Phase 5~~ ✅ Done |
+| Dynamic node discovery (gossip) | Phase 6+ |
+| Persistence (WAL / snapshots) | Phase 6+ |
+| Chaos testing | Phase 7+ |
 
 The `LRUCache` class is intentionally self-contained and import-friendly — the Phase 2 HTTP layer wraps it without modifying a single line.
 
@@ -474,13 +474,106 @@ npm run build     # TypeScript compiles with no errors
 
 ---
 
-### What's deferred to Phase 5+
+### What's deferred to Phase 6+
 
 | Feature | Why deferred |
 |---|---|
-| Delete replication | Replicas serve stale data after a delete until re-sync. Full delete fan-out deferred to Phase 5. |
-| Incremental / range-scoped re-sync | Full dump is naive for large caches. Phase 5 can scope by key range. |
-| Read quorum (R > 1) | Currently reads from the first live replica. A quorum read (R=2) provides stronger consistency. |
-| Dynamic node discovery (gossip) | Phase 5+ |
-| Persistence (WAL / snapshots) | Phase 5+ |
-| Docker / chaos harness | Phase 6+ |
+| Delete replication | Replicas serve stale data after a delete until re-sync. Full delete fan-out deferred. |
+| Incremental / range-scoped re-sync | Full dump is naive for large caches. Phase 6 can scope by key range. |
+| Read quorum (R > 1) | Currently reads from first live replica. A quorum read provides stronger consistency. |
+| Dynamic node discovery (gossip) | Phase 6+ |
+| Persistence (WAL / snapshots) | Phase 6+ |
+| Chaos testing harness | Phase 7+ |
+
+---
+
+## Phase 5 -- Docker Deployment
+
+### Quick start
+
+```powershell
+# Build images and start the 3-node cluster
+docker compose up --build -d
+
+# Check all 3 containers are healthy
+docker compose ps
+
+# Stream logs from one node
+docker compose logs -f node1
+
+# Tear down
+docker compose down
+```
+
+### Run test scripts against the Docker cluster
+
+```powershell
+# smoke-test.ps1 works with zero changes (talks to localhost:5001/5002/5003)
+.\scripts\smoke-test.ps1
+
+# failure-test.ps1: -UseDocker skips Start-Job, uses docker compose stop/start
+.\scripts\failure-test.ps1 -UseDocker
+
+# replication-test.ps1: same -UseDocker pattern
+.\scripts\replication-test.ps1 -UseDocker
+```
+
+Phase 5 verified results (against live Docker cluster):
+
+| Script | Result |
+|---|---|
+| smoke-test.ps1 | 5/5 PASS (zero changes required) |
+| failure-test.ps1 -UseDocker | 35/35 PASS |
+| replication-test.ps1 -UseDocker | 15/15 PASS |
+
+### Container networking: how PEERS works inside Docker
+
+Outside Docker, nodes reach each other via `localhost:500N`. Inside Docker each
+container has its own network namespace -- `localhost` inside the container refers
+to that container only, not its peers.
+
+Docker Compose creates a shared bridge network and makes each service's name a
+resolvable DNS hostname within that network. The `PEERS` env var therefore uses
+Docker service names as the host field:
+
+```
+PEERS=node1:node1:5001,node2:node2:5002,node3:node3:5003
+       ^^^^^ nodeId  ^^^^^ Docker DNS hostname  ^^^^^ port
+```
+
+Heartbeat pings, replica fan-out, and rejoin re-sync dump fetches are all
+container-to-container calls that use these service-name addresses.
+
+Host-side (`localhost:5001/5002/5003`) is handled by Docker port mapping:
+`ports: 5001:5001` forwards host traffic to the matching container. The
+existing test scripts run on the host and therefore need no changes at all.
+
+### Why multi-stage build?
+
+The builder stage installs all 396 packages (including TypeScript, ts-node, Jest)
+and compiles `src/` to `dist/`. The runtime stage starts fresh and installs only
+the 81 production packages (express, axios). This:
+
+- Keeps the final image lean (no TypeScript compiler, no test runner shipped).
+- Prevents accidental source-code leakage into the container.
+- Means layer cache invalidation on source changes only rebuilds the compile step,
+  not the much-slower full npm ci.
+
+### Why non-root user?
+
+The runtime stage creates a dedicated `vulcan` user (UID 1001) and runs the
+Node process under that account. Two reasons worth knowing:
+
+1. **Blast-radius containment**: if an attacker exploits the Node process and
+   escapes the container, a root container grants host-root access to the kernel
+   surface. A non-root user limits what they can do even if they escape.
+2. **Production compliance**: GKE, ECS, and most enterprise Kubernetes policies
+   enforce `runAsNonRoot` by default. Building this habit costs nothing.
+
+### What's deferred to Phase 6+
+
+- Multi-machine deployment (requires an orchestrator or bare-metal provisioning).
+- Docker Swarm / Kubernetes manifests.
+- Named volumes / persistence per container.
+- Centralised log aggregation (e.g. Loki, CloudWatch).
+- Per-container CPU/memory resource limits.
