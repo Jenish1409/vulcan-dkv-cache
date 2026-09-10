@@ -1,5 +1,5 @@
 /**
- * HashRing — Vulcan Phase 2: Consistent Hashing
+ * HashRing — Vulcan Phase 2 + 4: Consistent Hashing with replica placement.
  *
  * Why consistent hashing instead of naive `hash(key) % N`?
  * ──────────────────────────────────────────────────────────
@@ -154,6 +154,62 @@ export class HashRing {
     // Wrap around if keyHash is past the last virtual node (ring behaviour).
     const idx = lo % this.ring.length;
     return this.ring[idx].nodeId;
+  }
+
+  /**
+   * Return an ordered list of up to `n` DISTINCT physical nodes responsible
+   * for `key` — primary first, then replicas walking clockwise.
+   *
+   * Used by Phase 4 replication to determine where to fan-out writes and
+   * where to fall back on reads when the primary is dead.
+   *
+   * Edge cases:
+   *   - If the cluster has fewer physical nodes than `n`, returns all nodes
+   *     (never crashes — gracefully capped at cluster size).
+   *   - RF=1 returns just the primary (same as getNodeForKey).
+   *
+   * @param key  The cache key to look up.
+   * @param n    How many distinct physical nodes to return (replication factor).
+   * @throws {Error} if the ring is empty.
+   */
+  getReplicaNodes(key: string, n: number): string[] {
+    if (this.ring.length === 0) {
+      throw new Error("HashRing is empty — add at least one node first.");
+    }
+
+    // Cap at the number of available physical nodes so we never loop forever
+    // when REPLICATION_FACTOR > cluster size.
+    const count = Math.min(n, this.nodeSet.size);
+
+    const keyHash = this.hashToUint32(key);
+
+    // Binary search for the starting index (same logic as getNodeForKey).
+    let lo = 0;
+    let hi = this.ring.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.ring[mid].hash < keyHash) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+
+    const startIdx = lo % this.ring.length;
+    const result: string[] = [];
+    const seen = new Set<string>();
+
+    // Walk clockwise, skipping duplicate physical nodes (which arise because
+    // each physical node has VIRTUAL_NODES proxy points on the ring).
+    for (let i = 0; i < this.ring.length && result.length < count; i++) {
+      const vn = this.ring[(startIdx + i) % this.ring.length];
+      if (!seen.has(vn.nodeId)) {
+        seen.add(vn.nodeId);
+        result.push(vn.nodeId);
+      }
+    }
+
+    return result;
   }
 
   /**

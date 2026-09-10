@@ -132,8 +132,9 @@ Tests use **Jest fake timers** (`jest.useFakeTimers()`) so TTL expiry tests run 
 | ~~Consistent hashing ring~~ | ~~Phase 2~~ ✅ Done |
 | ~~Heartbeat / failure detection~~ | ~~Phase 3~~ ✅ Done |
 | ~~Ring recovery on node failure~~ | ~~Phase 3~~ ✅ Done |
-| Replication / quorum | Phase 4 |
-| Dynamic node discovery (gossip) | Phase 4 |
+| ~~Replication / read fallback~~ | ~~Phase 4~~ ✅ Done |
+| ~~Rejoin re-sync~~ | ~~Phase 4~~ ✅ Done |
+| Dynamic node discovery (gossip) | Phase 5+ |
 | Persistence (WAL / snapshots) | Phase 5+ |
 | Chaos testing | Phase 6+ |
 | Docker / deployment | Phase 7+ |
@@ -354,7 +355,132 @@ npm run build     # TypeScript compiles with no errors
 
 | Feature | Why deferred |
 |---|---|
-| Data recovery on rejoin | node2 comes back empty — requires replication to restore its key range |
+| Data recovery on rejoin | node2 comes back empty -- requires replication to restore its key range |
 | Keys migrated back to node2 | Needs gossip / data migration |
-| Consensus on cluster membership | Raft/Paxos — out of scope for Phase 3 |
+| Consensus on cluster membership | Raft/Paxos -- out of scope for Phase 3 |
 | Docker / chaos harness | Phase 5+ |
+
+---
+
+## Phase 4 -- Replication, Read Fallback & Rejoin Re-sync
+
+### What it does
+
+| Feature | Detail |
+|---|---|
+| **Replication factor** | Configurable `REPLICATION_FACTOR` (default: 2). Each key lives on 1 primary + 1 replica. |
+| **Replica placement** | `HashRing.getReplicaNodes(key, RF)` walks clockwise from primary, collecting N **distinct** physical nodes. Never picks the same physical node twice via a different virtual-node position. |
+| **Async write replication** | Primary writes locally, returns 200 to client, fires replica writes in background (fire-and-forget). Client latency is unaffected by replica write time. |
+| **Read fallback** | If the primary is DEAD, the reader falls back to the next live replica in order. Uses `fullRing` (stable, never modified) for replica placement and heartbeat status for liveness. |
+| **Rejoin re-sync** | When a dead node comes back ALIVE, surviving nodes push the relevant key-value pairs back to it. Entries are **filtered** before sending -- only keys where `fullRing.getReplicaNodes(key, RF).includes(rejoinedNodeId)` are pushed. |
+| **Two-ring architecture** | `ring` (modified by heartbeat) for live routing. `fullRing` (read-only, all peers) for stable replica placement. |
+
+---
+
+### Consistency model: Asynchronous replication
+
+**What it is**: The primary writes locally, responds to the client with 200, then fires writes to replica nodes in the background. The client never waits for replicas to acknowledge.
+
+**Why this choice**: It minimises write latency and is simple to implement correctly. For a portfolio project demonstrating distributed systems concepts, this is the right starting point.
+
+**The durability risk**: If the primary crashes in the tiny window *after* returning 200 to the client but *before* the background replica write completes, that write is permanently lost -- neither the primary (dead) nor the replica (never received it) has the data.
+
+**What a real system would do**: Offer a configurable `SYNC` mode: the primary waits for at least W replica acknowledgements before responding (W=1 means "at least one replica confirmed"). This eliminates the durability gap at the cost of added latency proportional to the slowest replica in your write quorum. Cassandra, DynamoDB, and Riak all expose this as a tunable `consistency_level` / `WriteConcern`.
+
+**Interview explanation**: "We chose async replication because it keeps write latency identical to a single-node store. The trade-off is a small durability window between the primary's response and the replica commit. In production I'd add a sync mode with quorum writes for critical data -- the `REPLICATION_FACTOR` and `W` (write quorum) are already the natural configuration knobs for that."
+
+---
+
+### Two-ring architecture: why it exists
+
+After a node dies, `HeartbeatManager` calls `ring.removeNode(deadNodeId)`. The dead node no longer exists in `ring`, so `ring.getReplicaNodes(key, RF)` can no longer return it.
+
+But to serve a read fallback we need to know: *who was holding the replica before the primary died?* That requires the **original** consistent-hashing assignment, which includes the dead node's virtual positions.
+
+Solution: maintain a **second ring** (`fullRing`) seeded from all configured peers and never modified. Rules:
+- `ring` -- used for routing new writes to live nodes only.
+- `fullRing` -- used for replica placement (read fallback, re-sync filtering). Read-only.
+
+---
+
+### Rejoin re-sync filtering (correctness invariant)
+
+When node2 rejoins, surviving nodes collect dumps from all live peers and their own caches. A peer's dump contains keys for **many different** primary/replica assignments -- not just node2's range.
+
+Before pushing anything to node2, each entry is filtered:
+
+```typescript
+const owners = fullRing.getReplicaNodes(key, REPLICATION_FACTOR);
+if (owners.includes(rejoinedNodeId)) {
+  // only push this key to the rejoining node
+}
+```
+
+This prevents node2 from receiving keys it is not responsible for, which would corrupt the ownership model.
+
+The filtering is **observable** in the logs:
+```
+[node1] RESYNC: 12/38 keys filtered for "node2" (26 skipped -- not in replica list)
+[node1] RESYNC complete for "node2": 12 pushed, 0 failed
+```
+
+---
+
+### Running the replication demo
+
+```powershell
+# Self-contained -- starts its own cluster, runs all 8 steps, cleans up
+.\scripts\replication-test.ps1
+```
+
+What it proves:
+1. Cluster starts with RF=2
+2. A key is written to node2 (primary) and confirmed on node1 (replica)
+3. node2 is killed
+4. `GET key` still returns the correct value, served by node1 (replica)
+5. This is **meaningfully different from Phase 3** -- Phase 3 returned 404
+6. New writes to node2's range route to surviving nodes
+7. node2 restarts, re-sync runs
+8. node2 has the key back
+
+#### Live results from an actual run
+
+```
+Step 2 -- key='repl-key-0'  primary=node2  replica=node1
+
+Step 3 -- replication confirmed:
+  PUT handledBy: node2
+  Replica node1 has value='phase4-value' via /internal/get  [PASS]
+
+Step 4 -- node2 killed. Heartbeat detects DEAD after 10s.
+
+Step 5 -- THE MONEY SHOT:
+  GET value='phase4-value'  handledBy=node1  [PASS]
+  (Phase 3 would have returned 404 here)
+
+Step 8 -- re-sync:
+  node2 has 'repl-key-0' back after re-sync  [PASS]
+  node1 sees node2 as ALIVE  [PASS]
+
+Results: 13 passed, 0 failed
+```
+
+#### Run all tests
+
+```bash
+npm test          # 63 (Phase 1-3) + 13 (Phase 4 getReplicaNodes) = 76 tests
+npm run build     # TypeScript compiles with no errors
+```
+
+---
+
+### What's deferred to Phase 5+
+
+| Feature | Why deferred |
+|---|---|
+| Delete replication | Replicas serve stale data after a delete until re-sync. Full delete fan-out deferred to Phase 5. |
+| Incremental / range-scoped re-sync | Full dump is naive for large caches. Phase 5 can scope by key range. |
+| Read quorum (R > 1) | Currently reads from the first live replica. A quorum read (R=2) provides stronger consistency. |
+| Dynamic node discovery (gossip) | Phase 5+ |
+| Persistence (WAL / snapshots) | Phase 5+ |
+| Docker / chaos harness | Phase 6+ |
