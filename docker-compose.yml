@@ -1,0 +1,88 @@
+# ── Container-networking note ──────────────────────────────────────────────────
+#
+# PEERS format: "nodeId:host:port"
+#
+# Inside Docker's bridge network, containers reach each other by SERVICE NAME,
+# not by "localhost".  So each container's PEERS uses Docker service names as
+# the host field:
+#
+#   PEERS=node1:node1:5001,node2:node2:5002,node3:node3:5003
+#                ^^^^^ Docker DNS name  ^^^^^ container-internal port
+#
+# Heartbeat pings, replica fan-out, and re-sync dump calls are all
+# container-to-container -- they use these service-name addresses.
+#
+# Host-facing ports (5001:5001 etc.) are handled by Docker's port mapping.
+# The existing test scripts (smoke-test.ps1, failure-test.ps1 -UseDocker,
+# replication-test.ps1 -UseDocker) talk to localhost:5001/5002/5003 from
+# outside Docker -- those requests are forwarded by Docker to the correct
+# container.  No changes needed in those scripts for the host-side URLs.
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  node1:
+    build: .
+    container_name: vulcan-node1
+    ports:
+      - "5001:5001"
+    environment:
+      NODE_ID: node1
+      PORT: "5001"
+      # Inter-container PEERS: service names as hostnames.
+      PEERS: "node1:node1:5001,node2:node2:5002,node3:node3:5003"
+      HEARTBEAT_INTERVAL_MS: "2000"
+      PING_TIMEOUT_MS: "1500"
+      FAILURE_THRESHOLD: "3"
+      REPLICATION_FACTOR: "2"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      - node2
+      - node3
+
+  node2:
+    build: .
+    container_name: vulcan-node2
+    ports:
+      - "5002:5002"
+    environment:
+      NODE_ID: node2
+      PORT: "5002"
+      PEERS: "node1:node1:5001,node2:node2:5002,node3:node3:5003"
+      HEARTBEAT_INTERVAL_MS: "2000"
+      PING_TIMEOUT_MS: "1500"
+      FAILURE_THRESHOLD: "3"
+      REPLICATION_FACTOR: "2"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      - node3
+
+  node3:
+    build: .
+    container_name: vulcan-node3
+    ports:
+      - "5003:5003"
+    environment:
+      NODE_ID: node3
+      PORT: "5003"
+      PEERS: "node1:node1:5001,node2:node2:5002,node3:node3:5003"
+      HEARTBEAT_INTERVAL_MS: "2000"
+      PING_TIMEOUT_MS: "1500"
+      FAILURE_THRESHOLD: "3"
+      REPLICATION_FACTOR: "2"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5003/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

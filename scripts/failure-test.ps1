@@ -1,31 +1,31 @@
 # Vulcan Phase 3 -- Self-Contained Failure & Recovery Test
 # -------------------------------------------------------------------------
 # Run from the project root:
-#   .\scripts\failure-test.ps1
+#   .\scripts\failure-test.ps1              # local ts-node cluster (Phase 3)
+#   .\scripts\failure-test.ps1 -UseDocker   # Docker cluster (Phase 5)
 #
-# Steps:
-#   1.  Start a 3-node cluster as background jobs
-#   2.  Confirm baseline health (all ALIVE)
-#   3.  Discover node2-owned keys via GET /ring/owner/:key (read-only probe)
-#   4.  Write those keys (stored on node2)
-#   5.  Kill node2
-#   6.  Wait for heartbeat detection (~6s)
-#   7.  Confirm node2 is DEAD in surviving nodes' /health clusterView
-#   8.  Confirm data on node2 is now 404  (no replication -- expected)
-#   9.  Write NEW keys into node2's range -- confirm rerouting to survivors
-#  10.  Restart node2
-#  11.  Wait for rejoin detection
-#  12.  Confirm node2 is ALIVE again
+# -UseDocker:
+#   Assumes 'docker compose up -d' was already run externally.
+#   Kills/restarts node2 via 'docker compose stop/start node2'.
+#   Sets RF=2 (matching docker-compose.yml) -- step 8 therefore expects 200
+#   (replica serves the data) rather than 404 (Phase 3 no-replication behavior).
+#
+# Without -UseDocker (default):
+#   Starts its own 3-node ts-node cluster as background jobs with RF=1
+#   (no replication) so step 8 still confirms Phase 3 data-loss behavior.
 # -------------------------------------------------------------------------
+
+param([switch]$UseDocker)
 
 $peers   = "node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"
 $rootDir = (Get-Location).Path
 
-# Short heartbeat so the test finishes quickly.
-# 3 failures x 2s interval = ~6s to declare DEAD.
 $hbInterval  = 2000
 $hbTimeout   = 1500
 $hbThreshold = 3
+# RF=1 for local (Phase 3 semantics: data lost on kill).
+# RF=2 for Docker (Phase 4 replication active: replica serves data after kill).
+$RF = if ($UseDocker) { 2 } else { 1 }
 
 $script:PASS = 0
 $script:FAIL = 0
@@ -76,43 +76,46 @@ Write-Host "=================================================" -ForegroundColor 
 Write-Host " Vulcan Phase 3 -- Failure and Recovery Test"    -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "-- Step 1: Starting 3-node cluster as background jobs --" -ForegroundColor Cyan
+Write-Host "-- Step 1: Starting 3-node cluster --" -ForegroundColor Cyan
 
-$jobArgs = @($rootDir, $peers, $hbInterval, $hbTimeout, $hbThreshold)
+$node1Job = $null; $node2Job = $null; $node3Job = $null; $node2JobNew = $null
 
-$node1Job = Start-Job -Name "ft-node1" -ScriptBlock {
-    param($rd, $p, $hi, $ht, $hf)
-    Set-Location $rd
-    $env:NODE_ID="node1"; $env:PORT="5001"; $env:PEERS=$p
-    $env:HEARTBEAT_INTERVAL_MS=$hi; $env:PING_TIMEOUT_MS=$ht; $env:FAILURE_THRESHOLD=$hf
-    npm run start:node 2>&1
-} -ArgumentList $jobArgs
+if (-not $UseDocker) {
+    $jobArgs = @($rootDir, $peers, $hbInterval, $hbTimeout, $hbThreshold, $RF)
 
-$node2Job = Start-Job -Name "ft-node2" -ScriptBlock {
-    param($rd, $p, $hi, $ht, $hf)
-    Set-Location $rd
-    $env:NODE_ID="node2"; $env:PORT="5002"; $env:PEERS=$p
-    $env:HEARTBEAT_INTERVAL_MS=$hi; $env:PING_TIMEOUT_MS=$ht; $env:FAILURE_THRESHOLD=$hf
-    npm run start:node 2>&1
-} -ArgumentList $jobArgs
+    $jobBlock = {
+        param($rd, $p, $hi, $ht, $hf, $rf, $nid, $port)
+        Set-Location $rd
+        $env:NODE_ID=$nid; $env:PORT=$port; $env:PEERS=$p
+        $env:HEARTBEAT_INTERVAL_MS=$hi; $env:PING_TIMEOUT_MS=$ht; $env:FAILURE_THRESHOLD=$hf
+        $env:REPLICATION_FACTOR=$rf
+        npm run start:node 2>&1
+    }
 
-$node3Job = Start-Job -Name "ft-node3" -ScriptBlock {
-    param($rd, $p, $hi, $ht, $hf)
-    Set-Location $rd
-    $env:NODE_ID="node3"; $env:PORT="5003"; $env:PEERS=$p
-    $env:HEARTBEAT_INTERVAL_MS=$hi; $env:PING_TIMEOUT_MS=$ht; $env:FAILURE_THRESHOLD=$hf
-    npm run start:node 2>&1
-} -ArgumentList $jobArgs
+    $node1Job = Start-Job -Name "ft-node1" -ScriptBlock $jobBlock -ArgumentList ($jobArgs + @("node1", "5001"))
+    $node2Job = Start-Job -Name "ft-node2" -ScriptBlock $jobBlock -ArgumentList ($jobArgs + @("node2", "5002"))
+    $node3Job = Start-Job -Name "ft-node3" -ScriptBlock $jobBlock -ArgumentList ($jobArgs + @("node3", "5003"))
 
-Write-Host "  Waiting for all 3 ports to bind (max 40s)..." -ForegroundColor DarkGray
-$allUp = WaitForPorts -Ports @(5001, 5002, 5003) -TimeoutSec 40
-if (-not $allUp) {
-    Write-Host "ABORT: Nodes did not start within 40 seconds." -ForegroundColor Red
-    Stop-Job  $node1Job, $node2Job, $node3Job -ErrorAction SilentlyContinue
-    Remove-Job $node1Job, $node2Job, $node3Job -ErrorAction SilentlyContinue
-    exit 1
+    Write-Host "  Waiting for all 3 ports to bind (max 40s)..." -ForegroundColor DarkGray
+    $allUp = WaitForPorts -Ports @(5001, 5002, 5003) -TimeoutSec 40
+    if (-not $allUp) {
+        Write-Host "ABORT: Nodes did not start within 40 seconds." -ForegroundColor Red
+        Stop-Job  $node1Job, $node2Job, $node3Job -ErrorAction SilentlyContinue
+        Remove-Job $node1Job, $node2Job, $node3Job -ErrorAction SilentlyContinue
+        exit 1
+    }
+    Write-Host "  All 3 nodes are up (RF=$RF, ts-node mode)." -ForegroundColor Green
+} else {
+    Write-Host "  UseDocker mode -- assuming 'docker compose up -d' was run." -ForegroundColor DarkGray
+    Write-Host "  Checking localhost:5001/5002/5003 are reachable (max 20s)..." -ForegroundColor DarkGray
+    $allUp = WaitForPorts -Ports @(5001, 5002, 5003) -TimeoutSec 20
+    if (-not $allUp) {
+        Write-Host "ABORT: Docker cluster not reachable on localhost:5001/5002/5003." -ForegroundColor Red
+        Write-Host "       Run: docker compose up -d" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  Docker cluster detected on ports 5001/5002/5003 (RF=$RF)." -ForegroundColor Green
 }
-Write-Host "  All 3 nodes are up." -ForegroundColor Green
 
 # =========================================================================
 # 2. Baseline health check
@@ -150,11 +153,11 @@ for ($i = 0; $i -lt 100; $i++) {
 }
 
 Write-Host "  node1 owns : $($node1Keys.Count) keys" -ForegroundColor DarkGray
-Write-Host "  node2 owns : $($node2Keys.Count) keys  <- these will be written then lost" -ForegroundColor Yellow
+Write-Host "  node2 owns : $($node2Keys.Count) keys  <- these will be written then killed" -ForegroundColor Yellow
 Write-Host "  node3 owns : $($node3Keys.Count) keys" -ForegroundColor DarkGray
 
 Assert -Condition ($node2Keys.Count -gt 0)  -Msg "At least one probe key hashes to node2"
-Assert -Condition ($node2Keys.Count -lt 80) -Msg "node2 owns less than 80%% of probe keys (distribution check)"
+Assert -Condition ($node2Keys.Count -lt 80) -Msg "node2 owns less than 80% of probe keys (distribution check)"
 
 # =========================================================================
 # 4. Write node2 keys before the kill
@@ -180,13 +183,20 @@ foreach ($k in $testNode2Keys) {
 Write-Host ""
 Write-Host "-- Step 5: Killing node2 --" -ForegroundColor Cyan
 
-Stop-Job  $node2Job -ErrorAction SilentlyContinue
-Remove-Job $node2Job -ErrorAction SilentlyContinue
-KillPort -Port 5002
-Start-Sleep -Milliseconds 500
+if ($UseDocker) {
+    Write-Host "  Stopping node2 container via docker compose..." -ForegroundColor DarkGray
+    Push-Location $rootDir
+    docker compose stop node2 2>&1 | Out-Null
+    Pop-Location
+    Start-Sleep -Milliseconds 500
+} else {
+    Stop-Job  $node2Job -ErrorAction SilentlyContinue
+    Remove-Job $node2Job -ErrorAction SilentlyContinue
+    KillPort -Port 5002
+    Start-Sleep -Milliseconds 500
+}
 
-# Verify port 5002 is actually closed
-$port5002Closed = -not (WaitForPorts -Ports @(5002) -TimeoutSec 1)
+$port5002Closed = -not (WaitForPorts -Ports @(5002) -TimeoutSec 2)
 Write-Host "  node2 killed. Port 5002 closed: $port5002Closed" -ForegroundColor Yellow
 
 # =========================================================================
@@ -214,11 +224,18 @@ foreach ($port in @(5001, 5003)) {
 }
 
 # =========================================================================
-# 8. Data-loss confirmation (expected -- no replication yet)
+# 8. Data check after kill
+#
+# Non-Docker (RF=1): data was NOT replicated -- expect 404 (data lost).
+# UseDocker  (RF=2): replica holds the data -- expect 200 (Phase 4).
 # =========================================================================
 
 Write-Host ""
-Write-Host "-- Step 8: Confirming data on dead node2 is gone (404, as expected) --" -ForegroundColor Cyan
+if ($UseDocker) {
+    Write-Host "-- Step 8: Confirming replica serves node2's data (RF=2, Phase 4) --" -ForegroundColor Cyan
+} else {
+    Write-Host "-- Step 8: Confirming data on dead node2 is gone (RF=1, 404 expected) --" -ForegroundColor Cyan
+}
 
 foreach ($k in $testNode2Keys) {
     $gotStatus = 0
@@ -228,8 +245,14 @@ foreach ($k in $testNode2Keys) {
     } catch {
         $gotStatus = [int]$_.Exception.Response.StatusCode
     }
-    Assert -Condition ($gotStatus -eq 404) `
-           -Msg "$k returns 404 (data was on node2, now gone -- expected, no replication) [got $gotStatus]"
+
+    if ($UseDocker) {
+        Assert -Condition ($gotStatus -eq 200) `
+               -Msg "$k returns 200 from replica (RF=2 replication active) [got $gotStatus]"
+    } else {
+        Assert -Condition ($gotStatus -eq 404) `
+               -Msg "$k returns 404 (RF=1, data lost on kill -- Phase 3 behavior) [got $gotStatus]"
+    }
 }
 
 # =========================================================================
@@ -271,13 +294,25 @@ foreach ($k in $reroutedTo.Keys) {
 Write-Host ""
 Write-Host "-- Step 10: Restarting node2 --" -ForegroundColor Cyan
 
-$node2JobNew = Start-Job -Name "ft-node2-rejoin" -ScriptBlock {
-    param($rd, $p, $hi, $ht, $hf)
-    Set-Location $rd
-    $env:NODE_ID="node2"; $env:PORT="5002"; $env:PEERS=$p
-    $env:HEARTBEAT_INTERVAL_MS=$hi; $env:PING_TIMEOUT_MS=$ht; $env:FAILURE_THRESHOLD=$hf
-    npm run start:node 2>&1
-} -ArgumentList $jobArgs
+if ($UseDocker) {
+    Write-Host "  Starting node2 container via docker compose..." -ForegroundColor DarkGray
+    Push-Location $rootDir
+    docker compose start node2 2>&1 | Out-Null
+    Pop-Location
+    $node2JobNew = $null
+} else {
+    $jobArgs = @($rootDir, $peers, $hbInterval, $hbTimeout, $hbThreshold, $RF)
+    $jobBlock = {
+        param($rd, $p, $hi, $ht, $hf, $rf, $nid, $port)
+        Set-Location $rd
+        $env:NODE_ID=$nid; $env:PORT=$port; $env:PEERS=$p
+        $env:HEARTBEAT_INTERVAL_MS=$hi; $env:PING_TIMEOUT_MS=$ht; $env:FAILURE_THRESHOLD=$hf
+        $env:REPLICATION_FACTOR=$rf
+        npm run start:node 2>&1
+    }
+    $node2JobNew = Start-Job -Name "ft-node2-rejoin" -ScriptBlock $jobBlock `
+                  -ArgumentList ($jobArgs + @("node2", "5002"))
+}
 
 Write-Host "  Waiting for port 5002 to bind (max 40s)..." -ForegroundColor DarkGray
 $restarted = WaitForPorts -Ports @(5002) -TimeoutSec 40
@@ -306,8 +341,12 @@ foreach ($port in @(5001, 5003)) {
 }
 
 Write-Host ""
-Write-Host "  NOTE: Keys written during node2 outage remain on node1/node3." -ForegroundColor Yellow
-Write-Host "  node2 rejoins EMPTY -- data recovery requires Phase 4 replication." -ForegroundColor Yellow
+if ($UseDocker) {
+    Write-Host "  RF=2: node2 rejoined and re-sync pushed relevant keys back." -ForegroundColor Yellow
+} else {
+    Write-Host "  NOTE: Keys written during node2 outage remain on node1/node3." -ForegroundColor Yellow
+    Write-Host "  node2 rejoins EMPTY (RF=1) -- data recovery requires Phase 4 replication." -ForegroundColor Yellow
+}
 
 # =========================================================================
 # Summary
@@ -324,14 +363,18 @@ Write-Host "=================================================" -ForegroundColor 
 Write-Host ""
 
 # =========================================================================
-# Cleanup
+# Cleanup (local ts-node mode only -- Docker cluster managed externally)
 # =========================================================================
 
-Write-Host "Stopping cluster jobs..." -ForegroundColor DarkGray
-Stop-Job   $node1Job, $node3Job, $node2JobNew -ErrorAction SilentlyContinue
-Remove-Job $node1Job, $node3Job, $node2JobNew -ErrorAction SilentlyContinue
-KillPort 5001; KillPort 5002; KillPort 5003
-Write-Host "Done." -ForegroundColor DarkGray
+if (-not $UseDocker) {
+    Write-Host "Stopping cluster jobs..." -ForegroundColor DarkGray
+    Stop-Job   $node1Job, $node3Job, $node2JobNew -ErrorAction SilentlyContinue
+    Remove-Job $node1Job, $node3Job, $node2JobNew -ErrorAction SilentlyContinue
+    KillPort 5001; KillPort 5002; KillPort 5003
+    Write-Host "Done." -ForegroundColor DarkGray
+} else {
+    Write-Host "Docker cluster left running. Stop with: docker compose down" -ForegroundColor DarkGray
+}
 Write-Host ""
 
 if ($script:FAIL -gt 0) { exit 1 }
