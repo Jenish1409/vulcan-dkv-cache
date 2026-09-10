@@ -128,7 +128,13 @@ export class HeartbeatManager {
     peers: NodeConfig[],
     ring: HashRing,
     config: HeartbeatConfig = DEFAULT_HEARTBEAT_CONFIG,
-    pingFn?: PingFn
+    pingFn?: PingFn,
+    /**
+     * Optional callback fired when a peer transitions DEAD → ALIVE.
+     * Called AFTER the ring has been updated (addNode already ran).
+     * Used by node.ts to trigger re-sync for the rejoining peer.
+     */
+    public readonly onRejoin?: (nodeId: string, config: NodeConfig) => void
   ) {
     this.selfId = selfId;
     this.ring = ring;
@@ -226,10 +232,8 @@ export class HeartbeatManager {
         console.log(
           `[${this.selfId}] ✅ PEER REJOINED: "${nodeId}" is back ALIVE — re-added to ring.`
         );
-        console.log(
-          `[${this.selfId}]    ⚠️  NOTE: "${nodeId}" rejoins EMPTY — data it held before dying is gone.` +
-          `  Data recovery requires Phase 4 replication.`
-        );
+        // Notify node.ts so it can trigger data re-sync from surviving peers.
+        this.onRejoin?.(nodeId, tracker.config);
       }
     } else {
       tracker.consecutiveFailures++;

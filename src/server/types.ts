@@ -1,5 +1,5 @@
 /**
- * Shared TypeScript interfaces for Vulcan Phase 2 + 3 server layer.
+ * Shared TypeScript interfaces for Vulcan Phase 2 + 3 + 4 server layer.
  *
  * Kept in a dedicated file so `node.ts`, `router.ts`, `HeartbeatManager.ts`,
  * and any future modules can import without circular dependencies.
@@ -116,3 +116,48 @@ export interface HealthResponse {
    */
   status: "ok";
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 — Replication types
+// ---------------------------------------------------------------------------
+
+/**
+ * One entry in the ordered replica list for a key.
+ * `role` is "primary" for the first node, "replica" for all others.
+ * `status` reflects this node's current heartbeat view of the peer's liveness.
+ */
+export interface ReplicaInfo {
+  nodeId: string;
+  role: "primary" | "replica";
+  /** Current liveness as seen by the node handling the request. */
+  status: "ALIVE" | "DEAD";
+}
+
+/**
+ * Response body for `GET /ring/replicas/:key`.
+ *
+ * Returns the full ordered replica list for a key with liveness status,
+ * so clients and scripts can determine primary + fallback nodes.
+ */
+export interface ReplicaOwnerResponse {
+  key: string;
+  replicationFactor: number;
+  replicas: ReplicaInfo[];
+}
+
+/** One entry in a cache dump (key + raw value). */
+export interface DumpEntry {
+  key: string;
+  value: unknown;
+}
+
+/**
+ * Response body for `GET /internal/dump`.
+ * Used by rejoining nodes to pull data from peers for re-sync.
+ */
+export interface DumpResponse {
+  nodeId: string;
+  entryCount: number;
+  entries: DumpEntry[];
+}
+

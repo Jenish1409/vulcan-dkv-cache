@@ -1,40 +1,44 @@
 /**
- * node.ts — Vulcan Phase 2 + 3: Per-node HTTP server with heartbeat.
+ * node.ts -- Vulcan Phase 2 + 3 + 4: Per-node HTTP server with heartbeat
+ *            and asynchronous replication.
  *
  * Each instance of this process is ONE node in the Vulcan cluster.
  * It owns:
- *   1. A local LRUCache (from Phase 1) — stores the keys it is
- *      responsible for according to the consistent hash ring.
- *   2. A HashRing — used by EVERY node to deterministically route any
- *      key to its correct owner, with no central coordinator.
- *   3. A HeartbeatManager (Phase 3) — periodically pings peers, marks them
- *      DEAD/ALIVE, and keeps the local ring in sync automatically.
- *   4. An Express HTTP server — handles client requests and forwards
- *      to peer nodes when the current node isn't the owner.
+ *   1. A local LRUCache (Phase 1) -- stores keys it is responsible for.
+ *   2. Two HashRing instances (Phase 2 + 4):
+ *        ring     -- live ring, modified by HeartbeatManager (removes dead
+ *                    nodes). Used for routing new client requests.
+ *        fullRing -- read-only ring seeded from ALL configured peers.
+ *                    Never modified. Used for replica-list lookup
+ *                    (essential when the primary is dead and not in ring).
+ *   3. A HeartbeatManager (Phase 3) -- pings peers, updates ring.
+ *   4. Async replication (Phase 4) -- fan-out writes to replica nodes,
+ *      read fallback to replicas when primary is dead, rejoin re-sync.
+ *   5. An Express HTTP server.
  *
- * ─── Architecture note ───────────────────────────────────────────────
- * This uses the "every node is a router" pattern rather than a
- * dedicated coordinator.  Trade-off: each non-owner request costs one
- * extra hop (client→any-node→owner-node), but there is no single point
- * of failure.  Phase 4 replication will allow reads from any replica,
- * eliminating the extra hop.
+ * -- Consistency model (Phase 4) --
+ * ASYNCHRONOUS replication. The primary writes locally, responds to the
+ * client immediately, then fans out to replicas in the background.
  *
- * ─── Startup ─────────────────────────────────────────────────────────
- * Required environment variables:
- *   NODE_ID   — logical ID for this node, e.g. "node1"
- *   PORT      — TCP port to listen on, e.g. "5001"
- *   PEERS     — comma-separated list of ALL nodes (including self):
- *               "node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"
+ * Trade-off: if the primary crashes AFTER responding but BEFORE a replica
+ * write completes, that write is permanently lost. A synchronous model
+ * (wait for at least one replica ack before replying) eliminates that risk
+ * at the cost of added latency. We choose async here for simplicity and
+ * note the limitation explicitly (see README Phase 4 section).
+ *
+ * -- Startup --
+ * Required:
+ *   NODE_ID   -- logical ID, e.g. "node1"
+ *   PORT      -- TCP port, e.g. "5001"
+ *   PEERS     -- "node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"
  *
  * Optional:
- *   MAX_CAPACITY      — LRUCache max keys per node  (default: 10000)
- *   SWEEP_INTERVAL    — active-expiry sweep interval ms (default: 5000)
- *   HEARTBEAT_INTERVAL_MS  — how often to ping peers (default: 2000)
- *   PING_TIMEOUT_MS        — per-ping HTTP timeout (default: 1500)
- *   FAILURE_THRESHOLD      — consecutive misses before DEAD (default: 3)
- *
- * Example (PowerShell):
- *   $env:NODE_ID="node1"; $env:PORT="5001"; $env:PEERS="node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"; npm run start:node
+ *   MAX_CAPACITY           -- LRUCache max keys       (default: 10000)
+ *   SWEEP_INTERVAL         -- active-expiry sweep ms  (default: 5000)
+ *   HEARTBEAT_INTERVAL_MS  -- ping interval ms        (default: 2000)
+ *   PING_TIMEOUT_MS        -- per-ping timeout ms     (default: 1500)
+ *   FAILURE_THRESHOLD      -- misses before DEAD      (default: 3)
+ *   REPLICATION_FACTOR     -- copies per key          (default: 2)
  */
 
 import express, { type Request, type Response, type NextFunction } from "express";
@@ -49,21 +53,22 @@ import type {
   KVMutateResponse,
   HealthResponse,
   PeerHealth,
+  ReplicaInfo,
+  ReplicaOwnerResponse,
+  DumpResponse,
 } from "./types";
 
-/** Typed route params for `/kv/:key` routes. */
-interface KVParams {
-  key: string;
-}
+/** Typed route params for /kv/:key and internal route handlers. */
+interface KVParams { key: string; }
 
 // ---------------------------------------------------------------------------
-// Read configuration from environment
+// Configuration
 // ---------------------------------------------------------------------------
 
-const NODE_ID = process.env["NODE_ID"] ?? "node1";
-const PORT = parseInt(process.env["PORT"] ?? "5001", 10);
-const MAX_CAPACITY = parseInt(process.env["MAX_CAPACITY"] ?? "10000", 10);
-const SWEEP_INTERVAL_MS = parseInt(process.env["SWEEP_INTERVAL"] ?? "5000", 10);
+const NODE_ID             = process.env["NODE_ID"] ?? "node1";
+const PORT                = parseInt(process.env["PORT"] ?? "5001", 10);
+const MAX_CAPACITY        = parseInt(process.env["MAX_CAPACITY"] ?? "10000", 10);
+const SWEEP_INTERVAL_MS   = parseInt(process.env["SWEEP_INTERVAL"] ?? "5000", 10);
 const HEARTBEAT_INTERVAL_MS = parseInt(
   process.env["HEARTBEAT_INTERVAL_MS"] ?? String(DEFAULT_HEARTBEAT_CONFIG.intervalMs), 10
 );
@@ -73,16 +78,17 @@ const PING_TIMEOUT_MS = parseInt(
 const FAILURE_THRESHOLD = parseInt(
   process.env["FAILURE_THRESHOLD"] ?? String(DEFAULT_HEARTBEAT_CONFIG.failureThreshold), 10
 );
-
 /**
- * Parse PEERS env var into structured NodeConfig objects.
- *
- * Format: "nodeId:host:port[,nodeId:host:port,...]"
- * If PEERS is not set, defaults to only this node (single-node mode).
- *
- * Example:
- *   PEERS=node1:localhost:5001,node2:localhost:5002,node3:localhost:5003
+ * How many distinct physical nodes hold each key (primary + replicas).
+ * Default: 2 (one primary + one replica). With 3 nodes, RF=2 tolerates
+ * one node failure without data loss.
  */
+const REPLICATION_FACTOR = parseInt(process.env["REPLICATION_FACTOR"] ?? "2", 10);
+
+// ---------------------------------------------------------------------------
+// Parse PEERS
+// ---------------------------------------------------------------------------
+
 function parsePeers(): NodeConfig[] {
   const raw = process.env["PEERS"] ?? `${NODE_ID}:localhost:${PORT}`;
   return raw.split(",").map((entry) => {
@@ -98,12 +104,29 @@ function parsePeers(): NodeConfig[] {
 }
 
 // ---------------------------------------------------------------------------
-// Cluster setup
+// Cluster setup -- TWO rings
 // ---------------------------------------------------------------------------
 
-const peers = parsePeers();
+const peers   = parsePeers();
 const nodeMap = new Map<string, NodeConfig>(peers.map((p) => [p.id, p]));
+
+/**
+ * LIVE ring -- starts with all peers, then HeartbeatManager removes dead nodes
+ * and re-adds rejoined ones. Used for routing new client requests.
+ */
 const ring = new HashRing(peers.map((p) => p.id));
+
+/**
+ * FULL ring -- seeded once from all configured peers; NEVER modified.
+ *
+ * Why a second ring? After the primary dies, HeartbeatManager removes it
+ * from ring. But to know which replica holds that key, we need the
+ * original consistent-hashing assignment -- which still requires the dead
+ * node's virtual positions on the ring. fullRing provides that stable view.
+ *
+ * Rule: fullRing is read-only. Only node.ts touches it (reads only).
+ */
+const fullRing = new HashRing(peers.map((p) => p.id));
 
 if (!nodeMap.has(NODE_ID)) {
   throw new Error(
@@ -111,16 +134,7 @@ if (!nodeMap.has(NODE_ID)) {
   );
 }
 
-// Non-self peers — the heartbeat manager only pings these.
 const remotePeers = peers.filter((p) => p.id !== NODE_ID);
-
-/** Phase 3: monitors peer liveness and keeps `ring` in sync. */
-const heartbeat = new HeartbeatManager(
-  NODE_ID,
-  remotePeers,
-  ring,
-  { intervalMs: HEARTBEAT_INTERVAL_MS, timeoutMs: PING_TIMEOUT_MS, failureThreshold: FAILURE_THRESHOLD }
-);
 
 // ---------------------------------------------------------------------------
 // Cache setup
@@ -134,6 +148,246 @@ const cache = new LRUCache<unknown>({
 const startTime = Date.now();
 
 // ---------------------------------------------------------------------------
+// Heartbeat status helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a snapshot of this node's current ALIVE/DEAD view of the cluster.
+ * Self is always ALIVE.
+ */
+function buildStatusMap(): Map<string, "ALIVE" | "DEAD"> {
+  const map = new Map<string, "ALIVE" | "DEAD">();
+  map.set(NODE_ID, "ALIVE");
+  for (const p of heartbeat.getPeerStatuses()) {
+    map.set(p.nodeId, p.status);
+  }
+  return map;
+}
+
+// ---------------------------------------------------------------------------
+// Replica helpers (fullRing -- stable, never modified)
+// ---------------------------------------------------------------------------
+
+/**
+ * Return the ordered replica NodeConfig list for key using fullRing.
+ * Primary is index 0. Capped at REPLICATION_FACTOR (or cluster size).
+ */
+function getReplicaConfigs(key: string): NodeConfig[] {
+  const nodeIds = fullRing.getReplicaNodes(key, REPLICATION_FACTOR);
+  return nodeIds
+    .map((id) => nodeMap.get(id))
+    .filter((n): n is NodeConfig => n !== undefined);
+}
+
+/**
+ * Return ReplicaInfo[] for the debug endpoint -- attaches ALIVE/DEAD per entry.
+ */
+function getReplicaInfos(key: string): ReplicaInfo[] {
+  const configs = getReplicaConfigs(key);
+  const statusMap = buildStatusMap();
+  return configs.map((c, i) => ({
+    nodeId: c.id,
+    role: i === 0 ? "primary" : "replica",
+    status: statusMap.get(c.id) ?? "DEAD",
+  } as ReplicaInfo));
+}
+
+// ---------------------------------------------------------------------------
+// Routing helpers (live ring)
+// ---------------------------------------------------------------------------
+
+/** Return the NodeConfig for the node that owns key on the LIVE ring. */
+function ownerOf(key: string): NodeConfig {
+  const ownerId = ring.getNodeForKey(key);
+  const node = nodeMap.get(ownerId);
+  if (node === undefined) {
+    throw new Error(`Ring returned unknown node ID "${ownerId}" for key "${key}".`);
+  }
+  return node;
+}
+
+/** True if this process is the given node. */
+function isSelf(node: NodeConfig): boolean {
+  return node.id === NODE_ID;
+}
+
+// ---------------------------------------------------------------------------
+// Async replication fan-out (write path)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fire-and-forget replica writes for a SET operation.
+ *
+ * Called AFTER the primary has already written locally and returned 200 to
+ * the client. Failures are logged but never propagate to the client --
+ * this is async (fire-and-forget) replication.
+ *
+ * Uses PUT /internal/replicate/:key on each replica so the replica writes
+ * directly to its cache WITHOUT triggering another fan-out round (avoids
+ * write storms and forwarding loops).
+ */
+function replicateToReplicas(key: string, body: KVSetBody): void {
+  // FIX (Phase 4 bug): was getReplicaConfigs(key).slice(1), which assumed
+  // NODE_ID is always fullRing's index-0 (primary). After failover, a
+  // different node may handle the write -- e.g., if node2 is dead and the
+  // live ring routes to node1 (fullRing's index-1 replica), slice(1) would
+  // self-replicate to node1 instead of sending to node3.
+  // Correct exclusion: send to every replica EXCEPT ourselves, by ID.
+  const replicas = getReplicaConfigs(key).filter((n) => n.id !== NODE_ID);
+  const statusMap = buildStatusMap();
+
+  for (const replica of replicas) {
+    if (statusMap.get(replica.id) === "DEAD") {
+      console.warn(
+        `[${NODE_ID}] REPLICATION SKIP: ${replica.id} is DEAD, skipping replica write for key "${key}"`
+      );
+      continue;
+    }
+
+    // Fire in background -- do NOT await
+    forwardRequest(replica, "PUT", `/internal/replicate/${encodeURIComponent(key)}`, body)
+      .then((result) => {
+        if (result.status !== 200) {
+          console.warn(
+            `[${NODE_ID}] REPLICATION WARN: replica ${replica.id} returned ${result.status} for key "${key}"`
+          );
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[${NODE_ID}] REPLICATION ERROR: failed to replicate "${key}" to ${replica.id}: ${msg}`
+        );
+      });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rejoin re-sync
+// ---------------------------------------------------------------------------
+
+/**
+ * Triggered by HeartbeatManager's onRejoin callback when a peer comes back
+ * ALIVE after being DEAD.
+ *
+ * Flow:
+ *   1. Collect all live peers (excluding self and the rejoining node).
+ *   2. Call GET /internal/dump on each, in parallel.
+ *   3. Merge all entries (deduplicate by key -- last writer wins).
+ *   4. FILTER: only keep entries where
+ *        fullRing.getReplicaNodes(key, RF).includes(rejoinedNodeId)
+ *      This prevents loading keys that do not belong to the rejoiner.
+ *   5. Push each filtered entry to the rejoining node via
+ *      PUT /internal/replicate/:key.
+ *
+ * This node acts as a coordinator -- it orchestrates the re-sync by
+ * collecting data from its own cache and peers and pushing it to the
+ * rejoining node.
+ */
+async function triggerRejoinResync(
+  rejoinedNodeId: string,
+  rejoinedConfig: NodeConfig
+): Promise<void> {
+  console.log(`[${NODE_ID}] RESYNC: initiating re-sync for rejoined peer "${rejoinedNodeId}"`);
+
+  // Step 1: Collect dumps from self and all live non-rejoining peers.
+  const statusMap = buildStatusMap();
+  const sources: Array<{ id: string; entries: Array<{ key: string; value: unknown }> }> = [];
+
+  // Include self's cache as one source.
+  sources.push({ id: NODE_ID, entries: cache.entries() });
+
+  // Include live remote peers (not self, not the rejoining node).
+  const livePeers = remotePeers.filter(
+    (p) => p.id !== rejoinedNodeId && statusMap.get(p.id) !== "DEAD"
+  );
+
+  const dumpResults = await Promise.allSettled(
+    livePeers.map((p) => forwardRequest(p, "GET", "/internal/dump"))
+  );
+
+  for (let i = 0; i < livePeers.length; i++) {
+    const result = dumpResults[i];
+    if (result.status === "fulfilled" && result.value.status === 200) {
+      const dump = result.value.data as DumpResponse;
+      sources.push({ id: livePeers[i]!.id, entries: dump.entries });
+    }
+  }
+
+  // Step 2: Merge entries (Map deduplicates; later source wins on collision).
+  const merged = new Map<string, unknown>();
+  for (const source of sources) {
+    for (const { key, value } of source.entries) {
+      merged.set(key, value);
+    }
+  }
+
+  // Step 3: FILTER -- only keep keys where rejoinedNodeId is in the replica list.
+  //
+  // This is the critical correctness step. A peer's dump may contain keys
+  // for ANY primary/replica assignment. We must only push keys that the
+  // rejoining node is actually responsible for (primary or replica per fullRing).
+  //
+  //   fullRing.getReplicaNodes(key, RF) returns e.g. ["node2", "node3"]
+  //   If rejoinedNodeId === "node2" --> keep this key.
+  //   If rejoinedNodeId is NOT in the list --> skip it.
+  //
+  const keysToSync: Array<{ key: string; value: unknown }> = [];
+  for (const [key, value] of merged) {
+    const owners = fullRing.getReplicaNodes(key, REPLICATION_FACTOR);
+    if (owners.includes(rejoinedNodeId)) {
+      keysToSync.push({ key, value });
+    }
+  }
+
+  console.log(
+    `[${NODE_ID}] RESYNC: ${keysToSync.length}/${merged.size} keys filtered for "${rejoinedNodeId}" ` +
+    `(${merged.size - keysToSync.length} skipped -- not in replica list)`
+  );
+
+  if (keysToSync.length === 0) {
+    console.log(`[${NODE_ID}] RESYNC: nothing to send to "${rejoinedNodeId}"`);
+    return;
+  }
+
+  // Step 4: Push filtered entries to the rejoining node in parallel.
+  const pushResults = await Promise.allSettled(
+    keysToSync.map(({ key, value }) =>
+      forwardRequest(
+        rejoinedConfig,
+        "PUT",
+        `/internal/replicate/${encodeURIComponent(key)}`,
+        { value }
+      )
+    )
+  );
+
+  const ok     = pushResults.filter((r) => r.status === "fulfilled").length;
+  const failed = pushResults.filter((r) => r.status === "rejected").length;
+  console.log(
+    `[${NODE_ID}] RESYNC complete for "${rejoinedNodeId}": ${ok} pushed, ${failed} failed`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HeartbeatManager
+// ---------------------------------------------------------------------------
+
+const heartbeat = new HeartbeatManager(
+  NODE_ID,
+  remotePeers,
+  ring,
+  { intervalMs: HEARTBEAT_INTERVAL_MS, timeoutMs: PING_TIMEOUT_MS, failureThreshold: FAILURE_THRESHOLD },
+  undefined, // use default axios ping function
+  (rejoinedNodeId, rejoinedConfig) => {
+    // Kick off re-sync without blocking the heartbeat tick.
+    triggerRejoinResync(rejoinedNodeId, rejoinedConfig).catch((err: unknown) => {
+      console.error(`[${NODE_ID}] RESYNC ERROR for "${rejoinedNodeId}":`, err);
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
 // Express app
 // ---------------------------------------------------------------------------
 
@@ -141,39 +395,16 @@ const app = express();
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
-// Routing helpers
-// ---------------------------------------------------------------------------
-
-/** Return the NodeConfig for the node that owns `key`. */
-function ownerOf(key: string): NodeConfig {
-  const ownerId = ring.getNodeForKey(key);
-  const node = nodeMap.get(ownerId);
-  if (node === undefined) {
-    // This should never happen if PEERS is configured correctly, but
-    // it's better to throw an informative error than silently return undefined.
-    throw new Error(`Ring returned unknown node ID "${ownerId}" for key "${key}".`);
-  }
-  return node;
-}
-
-/** True if this process is the owner of the given key. */
-function isSelf(node: NodeConfig): boolean {
-  return node.id === NODE_ID;
-}
-
-// ---------------------------------------------------------------------------
-// Routes
+// Routes -- Health and Debug
 // ---------------------------------------------------------------------------
 
 /**
  * GET /health
  *
- * Returns this node's status AND its current view of every peer's
- * liveness (Phase 3 addition).  The `clusterView` array lets operators
- * observe cluster health via HTTP without reading server logs.
+ * Returns this node's status + its current view of every peer's liveness.
+ * Extended in Phase 4 to include replication factor.
  */
 app.get("/health", (_req: Request, res: Response) => {
-  // Build clusterView: self (always ALIVE) + all tracked peers.
   const selfEntry: PeerHealth = {
     nodeId: NODE_ID,
     host: "localhost",
@@ -196,14 +427,9 @@ app.get("/health", (_req: Request, res: Response) => {
 });
 
 /**
- * GET /ring/owner/:key
+ * GET /ring/owner/:key  (Phase 3 debug endpoint -- kept for backward compat)
  *
- * Debug endpoint: returns which node WOULD own this key according to the
- * current local ring, WITHOUT storing anything.  Useful for pre-probing
- * key ownership before writes (e.g. failure-test.ps1 uses this to
- * identify which keys hash to each node before killing one).
- *
- * Returns 503 if the ring is empty (all nodes dead).
+ * Returns the primary owner using the LIVE ring.
  */
 app.get("/ring/owner/:key", (req: Request<KVParams>, res: Response) => {
   try {
@@ -217,12 +443,116 @@ app.get("/ring/owner/:key", (req: Request<KVParams>, res: Response) => {
 });
 
 /**
+ * GET /ring/replicas/:key  (Phase 4 debug endpoint)
+ *
+ * Returns the full ordered replica list for a key using fullRing (stable,
+ * includes dead nodes). Each entry shows ALIVE/DEAD status per this node's
+ * current heartbeat view.
+ *
+ * Use this endpoint (not /ring/owner) to determine primary + replica placement.
+ */
+app.get("/ring/replicas/:key", (req: Request<KVParams>, res: Response) => {
+  try {
+    const { key } = req.params;
+    const replicas = getReplicaInfos(key);
+    const body: ReplicaOwnerResponse = {
+      key,
+      replicationFactor: REPLICATION_FACTOR,
+      replicas,
+    };
+    res.json(body);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(503).json({ error: "Ring unavailable.", detail: msg });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Routes -- Internal (node-to-node only, not for external clients)
+// ---------------------------------------------------------------------------
+
+/**
+ * PUT /internal/replicate/:key
+ *
+ * Writes a key directly to THIS node's local cache WITHOUT triggering
+ * another replication fan-out. Used by:
+ *   - The primary when fanning out writes to replica nodes.
+ *   - The re-sync coordinator when pushing data to a rejoining node.
+ *
+ * This endpoint must NOT be confused with PUT /kv/:key (which routes to the
+ * primary and then fans out).
+ */
+app.put("/internal/replicate/:key", (req: Request<KVParams>, res: Response) => {
+  const { key } = req.params;
+  const body = req.body as KVSetBody;
+
+  if (!("value" in body)) {
+    res.status(400).json({ error: 'Body must include a "value" field.' });
+    return;
+  }
+
+  cache.set(key, body.value, body.ttlSeconds);
+  const response: KVMutateResponse = { ok: true, handledBy: NODE_ID };
+  res.json(response);
+});
+
+/**
+ * GET /internal/get/:key
+ *
+ * Reads directly from THIS node's local cache WITHOUT forwarding anywhere.
+ * Used by the read-fallback path to query specific replicas directly.
+ *
+ * Returns 404 if the key is absent or expired on this node.
+ */
+app.get("/internal/get/:key", (req: Request<KVParams>, res: Response) => {
+  const { key } = req.params;
+  const value = cache.get(key);
+
+  if (value === null) {
+    res.status(404).json({ error: "Key not found or expired on this node." });
+    return;
+  }
+
+  const response: KVGetResponse = { key, value, handledBy: NODE_ID };
+  res.json(response);
+});
+
+/**
+ * GET /internal/dump
+ *
+ * Returns ALL live (non-expired) key-value pairs from this node's cache.
+ * Used by the rejoin re-sync coordinator to gather data from peers.
+ *
+ * WARNING: Naive full-dump -- acceptable for Phase 4 dev cluster. A
+ * production system would use range-scoped incremental sync (e.g. streaming
+ * only the key ranges relevant to the requesting node).
+ */
+app.get("/internal/dump", (_req: Request, res: Response) => {
+  const entries = cache.entries();
+  const body: DumpResponse = {
+    nodeId: NODE_ID,
+    entryCount: entries.length,
+    entries,
+  };
+  res.json(body);
+});
+
+// ---------------------------------------------------------------------------
+// Routes -- Client-facing KV operations
+// ---------------------------------------------------------------------------
+
+/**
  * PUT /kv/:key
  *
- * Body: { value: unknown, ttlSeconds?: number }
+ * Write path (Phase 4):
+ *   1. If not primary: forward to primary (existing Phase 2 logic).
+ *   2. If primary:
+ *      a. Write locally.
+ *      b. Return 200 to client immediately (async replication).
+ *      c. Fire replica writes in background (non-blocking).
  *
- * Stores value under key.  If this node is not the key's owner,
- * forwards the request to the owner and relays its response.
+ * The client never waits for replica writes -- this is async replication.
+ * See the file-header comment for the consistency trade-off.
  */
 app.put("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunction) => {
   try {
@@ -237,12 +567,20 @@ app.put("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunc
         return;
       }
 
+      // Primary write.
       cache.set(key, body.value, body.ttlSeconds);
 
+      // Respond to client BEFORE firing replicas -- async replication.
       const response: KVMutateResponse = { ok: true, handledBy: NODE_ID };
       res.status(200).json(response);
+
+      // Background fan-out (non-blocking).
+      replicateToReplicas(key, body);
     } else {
-      const { status, data } = await forwardRequest(owner, "PUT", `/kv/${encodeURIComponent(key)}`, req.body);
+      // Not the primary -- forward to the live ring's owner.
+      const { status, data } = await forwardRequest(
+        owner, "PUT", `/kv/${encodeURIComponent(key)}`, req.body
+      );
       res.status(status).json(data);
     }
   } catch (err) {
@@ -253,28 +591,52 @@ app.put("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunc
 /**
  * GET /kv/:key
  *
- * Returns the value stored under key, or 404 if absent / expired.
- * The `handledBy` field in the response reveals which node actually
- * served the data — useful for verifying cross-node routing.
+ * Read path (Phase 4):
+ *   1. Compute the full replica list from fullRing (includes dead nodes).
+ *   2. Walk the list in order (primary first, then replicas).
+ *   3. For each node:
+ *      - If DEAD: skip.
+ *      - If self: read from local cache.
+ *      - If live peer: forward to GET /internal/get/:key (direct local read,
+ *        no further forwarding -- prevents forwarding loops).
+ *   4. If all nodes are DEAD or return 404: return 503.
+ *
+ * This is the key behavior change from Phase 3: a dead primary is silently
+ * bypassed and the replica answers instead.
  */
 app.get("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunction) => {
   try {
     const { key } = req.params;
-    const owner = ownerOf(key);
+    const replicaConfigs = getReplicaConfigs(key);
+    const statusMap = buildStatusMap();
 
-    if (isSelf(owner)) {
-      const value = cache.get(key);
+    for (const node of replicaConfigs) {
+      const nodeStatus = statusMap.get(node.id) ?? "DEAD";
+      if (nodeStatus === "DEAD") continue;
 
-      if (value === null) {
-        res.status(404).json({ error: "Key not found or expired." });
-      } else {
-        const response: KVGetResponse = { key, value, handledBy: NODE_ID };
-        res.json(response);
+      if (isSelf(node)) {
+        const value = cache.get(key);
+        if (value !== null) {
+          const response: KVGetResponse = { key, value, handledBy: NODE_ID };
+          return res.json(response);
+        }
+        // Key absent locally -- try next replica.
+        continue;
       }
-    } else {
-      const { status, data } = await forwardRequest(owner, "GET", `/kv/${encodeURIComponent(key)}`);
-      res.status(status).json(data);
+
+      // Forward to the peer's direct local-read endpoint (no re-routing).
+      const result = await forwardRequest(node, "GET", `/internal/get/${encodeURIComponent(key)}`);
+      if (result.status === 200) {
+        return res.status(200).json(result.data);
+      }
+      // 404 from peer -- try next replica.
     }
+
+    // All live replicas exhausted.
+    res.status(503).json({
+      error: "Key not available -- all replicas are dead or do not have this key.",
+      key,
+    });
   } catch (err) {
     next(err);
   }
@@ -283,8 +645,9 @@ app.get("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunc
 /**
  * DELETE /kv/:key
  *
- * Deletes the key from its owner node.
- * Returns 200 if the key existed and was deleted, 404 if it was absent.
+ * Routes to the primary (live ring). No replication of deletes in Phase 4
+ * -- replica nodes will serve stale data after a delete until re-sync.
+ * Full delete replication is deferred to Phase 5.
  */
 app.delete("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunction) => {
   try {
@@ -296,7 +659,9 @@ app.delete("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextF
       const response: KVMutateResponse = { ok: deleted, handledBy: NODE_ID };
       res.status(deleted ? 200 : 404).json(response);
     } else {
-      const { status, data } = await forwardRequest(owner, "DELETE", `/kv/${encodeURIComponent(key)}`);
+      const { status, data } = await forwardRequest(
+        owner, "DELETE", `/kv/${encodeURIComponent(key)}`
+      );
       res.status(status).json(data);
     }
   } catch (err) {
@@ -308,7 +673,6 @@ app.delete("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextF
 // Error handling middleware
 // ---------------------------------------------------------------------------
 
-// Must have four parameters for Express to recognise it as an error handler.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error(`[${NODE_ID}] Unhandled error:`, err.message);
@@ -321,14 +685,13 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 
 const server = app.listen(PORT, () => {
   console.log(`\n[${NODE_ID}] Vulcan node started`);
-  console.log(`[${NODE_ID}]   Listening on  : http://localhost:${PORT}`);
-  console.log(`[${NODE_ID}]   Cluster peers : ${peers.map((p) => `${p.id}@${p.host}:${p.port}`).join(", ")}`);
-  console.log(`[${NODE_ID}]   Cache capacity: ${MAX_CAPACITY} keys`);
-  console.log(`[${NODE_ID}]   Sweep interval: ${SWEEP_INTERVAL_MS}ms`);
-  console.log(`[${NODE_ID}]   Heartbeat     : every ${HEARTBEAT_INTERVAL_MS}ms, timeout ${PING_TIMEOUT_MS}ms, threshold ${FAILURE_THRESHOLD}\n`);
+  console.log(`[${NODE_ID}]   Listening on      : http://localhost:${PORT}`);
+  console.log(`[${NODE_ID}]   Cluster peers     : ${peers.map((p) => `${p.id}@${p.host}:${p.port}`).join(", ")}`);
+  console.log(`[${NODE_ID}]   Cache capacity    : ${MAX_CAPACITY} keys`);
+  console.log(`[${NODE_ID}]   Sweep interval    : ${SWEEP_INTERVAL_MS}ms`);
+  console.log(`[${NODE_ID}]   Heartbeat         : every ${HEARTBEAT_INTERVAL_MS}ms, timeout ${PING_TIMEOUT_MS}ms, threshold ${FAILURE_THRESHOLD}`);
+  console.log(`[${NODE_ID}]   Replication factor: ${REPLICATION_FACTOR}\n`);
 
-  // Start heartbeat AFTER the server is listening so that other nodes
-  // can already health-check US by the time we start checking them.
   heartbeat.start();
 });
 
@@ -337,9 +700,9 @@ const server = app.listen(PORT, () => {
 // ---------------------------------------------------------------------------
 
 function shutdown(signal: string): void {
-  console.log(`\n[${NODE_ID}] Received ${signal} — shutting down gracefully…`);
-  heartbeat.stop();  // stop pinging peers
-  cache.destroy();   // stop the TTL sweep timer
+  console.log(`\n[${NODE_ID}] Received ${signal} -- shutting down gracefully`);
+  heartbeat.stop();
+  cache.destroy();
   server.close(() => {
     console.log(`[${NODE_ID}] HTTP server closed.`);
     process.exit(0);
@@ -347,4 +710,4 @@ function shutdown(signal: string): void {
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGINT",  () => shutdown("SIGINT"));

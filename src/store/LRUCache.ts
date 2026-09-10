@@ -257,6 +257,27 @@ export class LRUCache<V = unknown> {
   }
 
   /**
+   * Return all live (non-expired) key-value pairs currently in the cache.
+   *
+   * Added in Phase 4 to support the `GET /internal/dump` endpoint used for
+   * replication re-sync when a node rejoins the cluster.
+   *
+   * Does NOT modify LRU order — purely a read operation.
+   *
+   * @returns Snapshot array; the cache can change after this call returns.
+   */
+  entries(): Array<{ key: string; value: V }> {
+    const now = Date.now();
+    const result: Array<{ key: string; value: V }> = [];
+    for (const [key, node] of this.map) {
+      if (node.expiresAt === undefined || node.expiresAt > now) {
+        result.push({ key, value: node.value });
+      }
+    }
+    return result;
+  }
+
+  /**
    * Remove all entries from the cache.
    */
   clear(): void {

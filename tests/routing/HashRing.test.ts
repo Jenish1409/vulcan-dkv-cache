@@ -1,5 +1,5 @@
 /**
- * HashRing unit tests — Vulcan Phase 2
+ * HashRing unit tests — Vulcan Phase 2 + 4
  *
  * Covers:
  *   a) Basic add / get / remove operations
@@ -8,6 +8,8 @@
  *   d) Minimal disruption — remapped keys go ONLY to the new node,
  *      never reshuffled between existing nodes
  *   e) Remove node — affected keys redistribute, no key maps to removed node
+ *   f) getReplicaNodes — Phase 4 replica placement (primary + replicas,
+ *      distinct physical nodes, RF > cluster size capping, edge cases)
  */
 
 import { HashRing } from "@/routing/HashRing";
@@ -259,5 +261,128 @@ describe("HashRing — removeNode redistribution", () => {
         expect(remaining.has(ring.getNodeForKey(k))).toBe(true);
       }
     }
+  });
+});
+
+// ===========================================================================
+// f) getReplicaNodes — Phase 4 replica placement
+// ===========================================================================
+
+describe("HashRing.getReplicaNodes", () => {
+  const NODES_3 = ["node1", "node2", "node3"];
+  const KEY = "test-key";
+
+  // ---- Basic correctness --------------------------------------------------
+
+  test("RF=1 returns exactly the primary (same as getNodeForKey)", () => {
+    const ring = new HashRing(NODES_3);
+    const primary = ring.getNodeForKey(KEY);
+    const replicas = ring.getReplicaNodes(KEY, 1);
+    expect(replicas).toHaveLength(1);
+    expect(replicas[0]).toBe(primary);
+  });
+
+  test("RF=2 returns primary + 1 distinct replica", () => {
+    const ring = new HashRing(NODES_3);
+    const replicas = ring.getReplicaNodes(KEY, 2);
+    expect(replicas).toHaveLength(2);
+    expect(new Set(replicas).size).toBe(2); // all distinct
+  });
+
+  test("RF=3 on a 3-node cluster returns all 3 distinct nodes", () => {
+    const ring = new HashRing(NODES_3);
+    const replicas = ring.getReplicaNodes(KEY, 3);
+    expect(replicas).toHaveLength(3);
+    expect(new Set(replicas).size).toBe(3);
+    // All configured nodes must appear
+    for (const n of NODES_3) {
+      expect(replicas).toContain(n);
+    }
+  });
+
+  test("primary is always index 0 and matches getNodeForKey", () => {
+    const ring = new HashRing(NODES_3);
+    const primary = ring.getNodeForKey(KEY);
+    const replicas = ring.getReplicaNodes(KEY, 2);
+    expect(replicas[0]).toBe(primary);
+  });
+
+  test("result contains no duplicate physical nodes", () => {
+    const ring = new HashRing(NODES_3);
+    for (const rf of [1, 2, 3]) {
+      const replicas = ring.getReplicaNodes(KEY, rf);
+      expect(new Set(replicas).size).toBe(replicas.length);
+    }
+  });
+
+  // ---- Edge case: RF > cluster size ----------------------------------------
+
+  test("RF > cluster size is gracefully capped (no crash, no duplicates)", () => {
+    const ring = new HashRing(NODES_3); // 3 nodes
+    const replicas = ring.getReplicaNodes(KEY, 10); // RF=10 > 3
+    expect(replicas.length).toBe(3); // capped at 3
+    expect(new Set(replicas).size).toBe(3); // still distinct
+  });
+
+  test("single-node cluster with RF=5 returns just that one node", () => {
+    const ring = new HashRing(["solo"]);
+    const replicas = ring.getReplicaNodes(KEY, 5);
+    expect(replicas).toHaveLength(1);
+    expect(replicas[0]).toBe("solo");
+  });
+
+  // ---- Empty ring ----------------------------------------------------------
+
+  test("throws if the ring is empty", () => {
+    const ring = new HashRing();
+    expect(() => ring.getReplicaNodes(KEY, 2)).toThrow("HashRing is empty");
+  });
+
+  // ---- Determinism ---------------------------------------------------------
+
+  test("same key always returns the same ordered replica list", () => {
+    const ring = new HashRing(NODES_3);
+    const first  = ring.getReplicaNodes(KEY, 3);
+    const second = ring.getReplicaNodes(KEY, 3);
+    expect(first).toEqual(second);
+  });
+
+  test("different keys can have different primaries", () => {
+    const ring = new HashRing(NODES_3);
+    const keys = Array.from({ length: 200 }, (_, i) => `key-${i}`);
+    const primaries = new Set(keys.map((k) => ring.getReplicaNodes(k, 1)[0]));
+    // With 3 nodes and 200 keys, all 3 should appear as primary for some key.
+    expect(primaries.size).toBeGreaterThan(1);
+  });
+
+  // ---- Interaction with addNode / removeNode --------------------------------
+
+  test("replica list updates correctly after removeNode", () => {
+    const ring = new HashRing(NODES_3);
+    const before = ring.getReplicaNodes(KEY, 3);
+    expect(before).toHaveLength(3);
+
+    ring.removeNode(before[0]); // remove the primary
+    const after = ring.getReplicaNodes(KEY, 3);
+
+    // Only 2 nodes left, so at most 2 replicas.
+    expect(after.length).toBeLessThanOrEqual(2);
+    // The removed node must NOT appear.
+    expect(after).not.toContain(before[0]);
+  });
+
+  test("RF=2 list on 2-node cluster contains both nodes", () => {
+    const ring = new HashRing(["a", "b"]);
+    const replicas = ring.getReplicaNodes(KEY, 2);
+    expect(replicas).toHaveLength(2);
+    expect(replicas).toContain("a");
+    expect(replicas).toContain("b");
+  });
+
+  test("all nodes appear as primary for at least one key (distribution)", () => {
+    const ring = new HashRing(NODES_3);
+    const keys = Array.from({ length: 500 }, (_, i) => `distrib-key-${i}`);
+    const seenAsPrimary = new Set(keys.map((k) => ring.getReplicaNodes(k, 1)[0]));
+    expect(seenAsPrimary.size).toBe(3);
   });
 });
