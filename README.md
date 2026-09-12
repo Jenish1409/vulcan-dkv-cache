@@ -135,8 +135,9 @@ Tests use **Jest fake timers** (`jest.useFakeTimers()`) so TTL expiry tests run 
 | ~~Replication / read fallback~~ | ~~Phase 4~~ ✅ Done |
 | ~~Rejoin re-sync~~ | ~~Phase 4~~ ✅ Done |
 | ~~Docker / containerised deployment~~ | ~~Phase 5~~ ✅ Done |
-| Dynamic node discovery (gossip) | Phase 6+ |
-| Persistence (WAL / snapshots) | Phase 6+ |
+| ~~Benchmarking (Vulcan vs Redis)~~ | ~~Phase 6~~ ✅ Done |
+| Dynamic node discovery (gossip) | Phase 7+ |
+| Persistence (WAL / snapshots) | Phase 7+ |
 | Chaos testing | Phase 7+ |
 
 The `LRUCache` class is intentionally self-contained and import-friendly — the Phase 2 HTTP layer wraps it without modifying a single line.
@@ -577,3 +578,55 @@ Node process under that account. Two reasons worth knowing:
 - Named volumes / persistence per container.
 - Centralised log aggregation (e.g. Loki, CloudWatch).
 - Per-container CPU/memory resource limits.
+
+---
+
+## Phase 6 -- Benchmarking (Vulcan vs Redis)
+
+Full results, raw data, and honest analysis in [`benchmarks/README.md`](./benchmarks/README.md).
+
+### Headline numbers
+
+**Environment:** Docker Desktop (WSL2), Node.js v22.19.0, autocannon v8, redis npm client v4.
+
+| Scenario | Vulcan (3-node, RF=2) | Redis (Node client) | Redis (native ceiling) |
+|---|---|---|---|
+| GET throughput (c=50) | **2,193 req/s** | 14,162 ops/s | 167,504 ops/s |
+| PUT/SET throughput (c=50) | **1,119 req/s** | 13,854 ops/s | 158,228 ops/s |
+| Mixed 80/20 (c=50) | **1,942 req/s** | 13,556 ops/s | ~160,000 ops/s |
+| GET p50 / p99 (c=10) | **4 ms / 11 ms** | 0.74 ms / 2.55 ms | 0.15 ms / 0.44 ms |
+
+### Forwarding-hop delta
+
+Only variable: whether the key is owned by the node being hit, or must proxy to a peer.
+
+| | req/s | p50 | p99 |
+|---|---|---|---|
+| Local GET (no hop) | 4,959 | 1 ms | 5 ms |
+| Forwarded GET (proxy to node2) | 1,526 | 6 ms | 13 ms |
+| **Hop cost** | **3.25× slower** | **+5 ms** | **+8 ms** |
+
+### Why the gap exists (short version)
+
+1. **HTTP/JSON vs RESP binary** -- headers, JSON parse/stringify, Express middleware (~5-10× alone)
+2. **Node.js vs C** -- V8 GC pauses visible in p99 tails (~2-3× on top)
+3. **Cross-node forwarding** -- doubles HTTP overhead per proxied request (measured: 3.25× throughput reduction, +5ms p50)
+4. **Async replication** -- PUT fan-out adds background pressure; PUT p99 (112ms) is 2× GET p99 (56ms)
+
+### Run benchmarks yourself
+
+```powershell
+# Cluster must be running first
+docker compose up -d
+
+# One-command full benchmark suite (autocannon + redis npm + redis-benchmark)
+.\scripts\run-benchmarks.ps1
+
+# Results saved to benchmarks/raw/ (JSON + txt)
+```
+
+### What's deferred to Phase 7+
+
+- Chaos testing harness
+- Benchmark with RF=1 disabled to isolate replication overhead precisely
+- Performance tuning (msgpack, multi-core Node.js cluster, HTTP/2) -- no code changes in Phase 6 per spec

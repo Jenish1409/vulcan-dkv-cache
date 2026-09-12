@@ -2,3 +2,7 @@ node_modules/
 dist/
 coverage/
 *.js.map
+
+# Benchmark raw output (regenerated on every run-benchmarks.ps1 invocation)
+benchmarks/raw/*.json
+benchmarks/raw/*.txt
