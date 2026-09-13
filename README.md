@@ -627,6 +627,78 @@ docker compose up -d
 
 ### What's deferred to Phase 7+
 
-- Chaos testing harness
+- ~~Chaos testing harness~~ ✅ **Phase 7 complete — see below**
 - Benchmark with RF=1 disabled to isolate replication overhead precisely
 - Performance tuning (msgpack, multi-core Node.js cluster, HTTP/2) -- no code changes in Phase 6 per spec
+
+---
+
+## Phase 7 — Chaos Testing Harness
+
+A separate tool (`chaos/`) that runs continuous load against the live cluster,
+injects failure scenarios, and checks every response for consistency violations.
+
+### What it does
+
+| Component | Description |
+|---|---|
+| **Load generator** | 5 workers × 20 req/s, 40% SET / 60% GET, randomised key pool |
+| **Fault injector** | Node kill (`docker compose stop`), network isolation (`docker network disconnect`), malformed value injection |
+| **Flight recorder** | Synchronous JSONL log — crash-safe, one entry per operation |
+| **Linearizability checker** | Self-validates, checks INVENTED\_VALUE and FUTURE\_READ hard invariants |
+
+### Fault scenario sequence
+
+```
+T+0–15s    Baseline
+T+15–45s   Kill node2 (30s down)
+T+45–75s   node2 rejoin + re-sync window
+T+75–95s   Isolate node1 from Docker network (20s)
+T+95–115s  Restore node1, reconverge
+T+115–120s Malformed value injection (expects 400)
+T+120–180s Final baseline
+```
+
+### What the two runs found
+
+**Malformed value (Run 1):** Express's default 100 KB body-parser limit
+intercepted the 1 MB request and returned 500 before our validator ran.
+Fixed: `app.use(express.json({ limit: '2mb' }))`.
+**Malformed value (Run 2):** ✅ 400 correctly returned.
+
+**Two Generals Problem — reproduced on BOTH runs:**
+
+> A write that appeared to fail (HTTP timeout during network isolation)
+> was actually committed on the primary node. After reconnection, the
+> primary served this "phantom" value to subsequent GETs.
+
+This is a **fundamental limitation of single-round-trip HTTP writes without
+distributed coordination** — not a Vulcan implementation bug and not a
+patch target. Every AP-model KV store without 2PC/Raft/Paxos has this window.
+
+The linearizability checker correctly detected it as INVENTED\_VALUE:
+the client's application state said "that value was never written" but
+the cluster disagreed. The exact reproducing sequence is documented in
+[`chaos/README.md`](chaos/README.md).
+
+| Run | Operations | INVENTED_VALUE | FUTURE_READ | Stale reads | Malformed result |
+|---|---|---|---|---|---|
+| Run 1 | ~2,900 | **9** | 0 | 61 (informational) | ⚠️ 500 (body-parser) |
+| Run 2 | ~2,900 | **14** | 0 | 65 (informational) | ✅ 400 |
+
+### Run it
+
+```powershell
+docker compose up -d
+.\scripts\run-chaos.ps1                      # default: 3 min, 20 req/s
+.\scripts\run-chaos.ps1 -DurationSec 300     # longer run
+
+# Re-analyze saved log without re-running:
+npx --prefix chaos ts-node chaos/src/checker.ts chaos/logs/chaos-TIMESTAMP.jsonl
+```
+
+### What's deferred to Phase 8+
+
+- Visual dashboard (Phase 8)
+- Idempotency keys (Option C from Phase 7) — client-side protocol change, future work
+

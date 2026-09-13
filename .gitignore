@@ -6,3 +6,6 @@ coverage/
 # Benchmark raw output (regenerated on every run-benchmarks.ps1 invocation)
 benchmarks/raw/*.json
 benchmarks/raw/*.txt
+
+# Chaos testing flight-recorder logs (regenerated each run)
+chaos/logs/*.jsonl
