@@ -392,7 +392,12 @@ const heartbeat = new HeartbeatManager(
 // ---------------------------------------------------------------------------
 
 const app = express();
-app.use(express.json());
+// Body-parser limit is set to 2 MB so that requests up to 1 MB + overhead
+// are parsed and reach our explicit MAX_VALUE_BYTES validator in PUT /kv/:key,
+// which returns a clear 400. Without this, express's default 100 KB limit
+// would intercept oversized payloads first and produce a confusing 500 via
+// the generic error handler.
+app.use(express.json({ limit: '2mb' }));
 
 // ---------------------------------------------------------------------------
 // Routes -- Health and Debug
@@ -566,6 +571,40 @@ app.put("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunc
         res.status(400).json({ error: 'Request body must include a "value" field.' });
         return;
       }
+
+      // ── Phase 7 (2b): Value-size validation ─────────────────────────────
+      // Intentional, scoped application-logic change for Phase 7 (the chaos
+      // harness's malformed-value scenario verifies this rejection).
+      //
+      // Reject values whose JSON representation exceeds MAX_VALUE_BYTES.
+      // This prevents a single write from consuming unbounded memory and
+      // ensures bad input returns a clear 400 instead of silently being
+      // stored or causing a crash.
+      //
+      // JSON.stringify returns `undefined` for un-serializable inputs
+      // (functions, symbols, circular refs) -- we treat those as invalid too.
+      const MAX_VALUE_BYTES = 1024 * 1024; // 1 MB
+      let serializedSize: number;
+      try {
+        const serialized = JSON.stringify(body.value);
+        if (serialized === undefined) {
+          res.status(400).json({ error: "Value is not JSON-serializable." });
+          return;
+        }
+        serializedSize = Buffer.byteLength(serialized, "utf8");
+      } catch {
+        res.status(400).json({ error: "Value is not JSON-serializable." });
+        return;
+      }
+      if (serializedSize > MAX_VALUE_BYTES) {
+        res.status(400).json({
+          error:  `Value too large: ${serializedSize} bytes exceeds the 1 MB limit.`,
+          limit:  MAX_VALUE_BYTES,
+          actual: serializedSize,
+        });
+        return;
+      }
+      // ── End Phase 7 (2b) ─────────────────────────────────────────────────
 
       // Primary write.
       cache.set(key, body.value, body.ttlSeconds);
