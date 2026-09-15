@@ -659,32 +659,37 @@ T+115–120s Malformed value injection (expects 400)
 T+120–180s Final baseline
 ```
 
-### What the two runs found
+### Key findings (Phases 7 + 8 combined — 5 total runs)
 
-**Malformed value (Run 1):** Express's default 100 KB body-parser limit
-intercepted the 1 MB request and returned 500 before our validator ran.
-Fixed: `app.use(express.json({ limit: '2mb' }))`.
-**Malformed value (Run 2):** ✅ 400 correctly returned.
+**Malformed value bug found and fixed (Run 1):** Express's default 100 KB
+body-parser limit intercepted the 1 MB test request before our validator ran,
+returning a confusing 500. Fixed: `express.json({ limit: '2mb' })`.
+Confirmed correct (400) in all subsequent runs.
 
-**Two Generals Problem — reproduced on BOTH runs:**
+**Two Generals Problem — reproduced in every run (5/5):**
 
 > A write that appeared to fail (HTTP timeout during network isolation)
 > was actually committed on the primary node. After reconnection, the
 > primary served this "phantom" value to subsequent GETs.
 
 This is a **fundamental limitation of single-round-trip HTTP writes without
-distributed coordination** — not a Vulcan implementation bug and not a
-patch target. Every AP-model KV store without 2PC/Raft/Paxos has this window.
+distributed coordination** — not a Vulcan implementation bug.
+Every AP-model KV store without 2PC/Raft/Paxos has this window.
+The linearizability checker correctly detected each occurrence as INVENTED\_VALUE.
 
-The linearizability checker correctly detected it as INVENTED\_VALUE:
-the client's application state said "that value was never written" but
-the cluster disagreed. The exact reproducing sequence is documented in
-[`chaos/README.md`](chaos/README.md).
+| Run | Dur | Rate | Ops | INVENTED\_VALUE | FUTURE\_READ | Stale | Malformed |
+|---|---|---|---|---|---|---|---|
+| 1 (Ph.7) | 180s | 20/s | ~2,900 | **9** | 0 | 61 | [500 bug] |
+| 2 (Ph.7) | 180s | 20/s | ~2,900 | **14** | 0 | 65 | 400 OK |
+| A (Ph.8) | 300s | 20/s | ~4,800 | **34** | 0 | 110 | 400 OK |
+| B (Ph.8) | 180s | 40/s | ~5,800 | **35** | 0 | 288 | 400 OK |
+| C (Ph.8) | 180s | 20/s | ~2,900 | **31** | 0 | 162 | 400 OK |
 
-| Run | Operations | INVENTED_VALUE | FUTURE_READ | Stale reads | Malformed result |
-|---|---|---|---|---|---|
-| Run 1 | ~2,900 | **9** | 0 | 61 (informational) | ⚠️ 500 (body-parser) |
-| Run 2 | ~2,900 | **14** | 0 | 65 (informational) | ✅ 400 |
+Higher load (40 req/s) increased violation count ≈2.5× for the same duration —
+more concurrent writes land during the fault window, generating more phantom
+commits. No new violation category appeared at any load level.
+
+Full evidence, three-phase anatomy, and reproducibility analysis: [`chaos/RESULTS.md`](chaos/RESULTS.md)
 
 ### Run it
 
@@ -697,8 +702,8 @@ docker compose up -d
 npx --prefix chaos ts-node chaos/src/checker.ts chaos/logs/chaos-TIMESTAMP.jsonl
 ```
 
-### What's deferred to Phase 8+
+### What's deferred to Phase 9
 
-- Visual dashboard (Phase 8)
-- Idempotency keys (Option C from Phase 7) — client-side protocol change, future work
+- Visual dashboard for live chaos run monitoring
+- Idempotency keys (Option C) — client-side protocol change, legitimate future work
 
