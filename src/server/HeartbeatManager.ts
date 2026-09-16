@@ -134,7 +134,14 @@ export class HeartbeatManager {
      * Called AFTER the ring has been updated (addNode already ran).
      * Used by node.ts to trigger re-sync for the rejoining peer.
      */
-    public readonly onRejoin?: (nodeId: string, config: NodeConfig) => void
+    public readonly onRejoin?: (nodeId: string, config: NodeConfig) => void,
+    /**
+     * Optional callback fired on ANY peer status transition (ALIVE→DEAD or
+     * DEAD→ALIVE). Called AFTER ring updates (addNode/removeNode) have run.
+     * Used by Phase 9's SSE event bus to stream heartbeat events to the
+     * dashboard without modifying the state-machine logic.
+     */
+    public readonly onPeerStatusChange?: (nodeId: string, status: 'ALIVE' | 'DEAD') => void
   ) {
     this.selfId = selfId;
     this.ring = ring;
@@ -234,6 +241,8 @@ export class HeartbeatManager {
         );
         // Notify node.ts so it can trigger data re-sync from surviving peers.
         this.onRejoin?.(nodeId, tracker.config);
+        // Phase 9: stream status change to the dashboard SSE bus.
+        this.onPeerStatusChange?.(nodeId, 'ALIVE');
       }
     } else {
       tracker.consecutiveFailures++;
@@ -249,6 +258,8 @@ export class HeartbeatManager {
           `[${this.selfId}] ❌ PEER DEAD: "${nodeId}" failed ${tracker.consecutiveFailures} ` +
           `consecutive health checks — removed from ring.  Its key range now routes to the next node.`
         );
+        // Phase 9: stream status change to the dashboard SSE bus.
+        this.onPeerStatusChange?.(nodeId, 'DEAD');
       } else if (tracker.state === "ALIVE") {
         // Not yet at threshold — log at debug level for visibility.
         console.log(
