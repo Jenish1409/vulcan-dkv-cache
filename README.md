@@ -707,3 +707,86 @@ npx --prefix chaos ts-node chaos/src/checker.ts chaos/logs/chaos-TIMESTAMP.jsonl
 - Visual dashboard for live chaos run monitoring
 - Idempotency keys (Option C) — client-side protocol change, legitimate future work
 
+
+---
+
+## Phase 9 — Live Visual Dashboard
+
+A real-time browser dashboard that visualises the Vulcan cluster as it runs —
+hash ring, live traffic, and chaos events happening in front of you.
+
+### Architecture
+
+```
+Vulcan nodes (5001-5003)             dashboard/
+  node.ts + SSE /events ──SSE──>  server/index.ts (port 4000)
+                                    merges 3 streams → WS broadcast
+                                    POST /chaos/* → docker commands
+                                         │ ws://localhost:4000
+                                    React/Vite UI (port 5173)
+                                    HashRing SVG | EventLog
+                                    StatsBar     | ChaosControls
+```
+
+**SSE (node → aggregator):** One-directional, plain HTTP, reuses Express.
+Zero latency cost on the write/read hot path — emits are in-memory function calls.
+
+**WebSocket (aggregator → browser):** Bidirectional, so the browser can also
+send chaos commands back to the aggregator.
+
+### How to run
+
+**Prerequisites:** Docker cluster must be running first.
+
+```powershell
+# Terminal 1 — start the cluster (already running if you used Phase 7/8)
+docker compose up -d
+
+# Terminal 2 — start the aggregator
+cd dashboard
+npm install          # first time only
+npm run server       # npx tsx server/index.ts  →  ws://localhost:4000
+
+# Terminal 3 — start the frontend
+cd dashboard
+npm run dev          # Vite dev server  →  http://localhost:5173
+```
+
+Open **http://localhost:5173** in your browser. The hash ring, live event log,
+and stats bar populate immediately as requests flow through the cluster.
+
+### Dashboard features
+
+| Panel | What it shows |
+|---|---|
+| **Hash ring (SVG)** | 3 nodes at 120° intervals; green glow = ALIVE, red = DEAD; packet ripples on each op |
+| **Stats bar** | `N/3 nodes healthy · RF: 2 · Total ops · SETs · GETs` |
+| **Event log** | Rolling last-20 events; colour-coded by type (SET/GET/REPL/HB) |
+| **Chaos controls** | Kill node2/3, Isolate node1/2, Restore All — each button stays disabled until the docker command actually completes |
+
+### Chaos buttons
+
+Buttons call `POST /chaos/*` on the aggregator (runs on your host, has docker
+access). **Buttons are disabled until the aggregator confirms the docker
+command completed** — not a fixed timer — to prevent overlapping commands.
+
+Conflict-state handling:
+- *Isolate an already-stopped node* → non-destructive warning, no state corruption
+- *Restore all when nothing is down* → treated as no-ops, returns success
+- *Kill an already-isolated node* → `docker stop` succeeds normally
+
+Known limitation: two concurrent browser tabs can race. Fine for single-user
+demo use.
+
+### Generating a demo GIF / video
+
+1. Start the cluster + aggregator + Vite dev server (see above)
+2. Open http://localhost:5173
+3. Click **Kill node2** → watch node2 turn red on the ring within ~6s
+4. Click **Restore All** → watch node2 turn green, rejoin re-sync event appears
+5. Run `.\scripts\run-chaos.ps1` in a 4th terminal — watch the ring pulse with
+   live traffic and the event log stream in real time
+6. Screen-record the browser window; trim to 2–3 min
+
+> 📸 _Screenshot / GIF placeholder — add after recording_
+

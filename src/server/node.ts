@@ -42,6 +42,7 @@
  */
 
 import express, { type Request, type Response, type NextFunction } from "express";
+import { EventEmitter } from "events";
 import { LRUCache } from "../store";
 import { HashRing } from "../routing/HashRing";
 import { forwardRequest } from "./router";
@@ -148,6 +149,26 @@ const cache = new LRUCache<unknown>({
 const startTime = Date.now();
 
 // ---------------------------------------------------------------------------
+// SSE event bus (Phase 9 — dashboard event streaming)
+// ---------------------------------------------------------------------------
+
+/**
+ * In-memory pub/sub for the dashboard SSE stream.
+ *
+ * Performance note: emitEvent() is a synchronous in-memory function call.
+ * It does NOT add a network hop to any existing handler. The replica-event
+ * emits live inside the already-existing .then()/.catch() callbacks, so they
+ * add zero latency to the primary write path. All Phase 6 benchmark numbers
+ * remain valid.
+ */
+const eventBus = new EventEmitter();
+eventBus.setMaxListeners(200); // allow many concurrent SSE subscribers
+
+function emitEvent(payload: Record<string, unknown>): void {
+  eventBus.emit("sse", { ...payload, ts: Date.now(), source: NODE_ID });
+}
+
+// ---------------------------------------------------------------------------
 // Heartbeat status helpers
 // ---------------------------------------------------------------------------
 
@@ -247,7 +268,9 @@ function replicateToReplicas(key: string, body: KVSetBody): void {
     // Fire in background -- do NOT await
     forwardRequest(replica, "PUT", `/internal/replicate/${encodeURIComponent(key)}`, body)
       .then((result) => {
-        if (result.status !== 200) {
+        const success = result.status === 200;
+        emitEvent({ type: "replication", key, replicaId: replica.id, success });
+        if (!success) {
           console.warn(
             `[${NODE_ID}] REPLICATION WARN: replica ${replica.id} returned ${result.status} for key "${key}"`
           );
@@ -255,6 +278,7 @@ function replicateToReplicas(key: string, body: KVSetBody): void {
       })
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
+        emitEvent({ type: "replication", key, replicaId: replica.id, success: false });
         console.warn(
           `[${NODE_ID}] REPLICATION ERROR: failed to replicate "${key}" to ${replica.id}: ${msg}`
         );
@@ -384,7 +408,9 @@ const heartbeat = new HeartbeatManager(
     triggerRejoinResync(rejoinedNodeId, rejoinedConfig).catch((err: unknown) => {
       console.error(`[${NODE_ID}] RESYNC ERROR for "${rejoinedNodeId}":`, err);
     });
-  }
+  },
+  // Phase 9: stream peer heartbeat transitions to the dashboard SSE bus.
+  (peerId, status) => { emitEvent({ type: "heartbeat", peerId, status }); }
 );
 
 // ---------------------------------------------------------------------------
@@ -609,6 +635,9 @@ app.put("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunc
       // Primary write.
       cache.set(key, body.value, body.ttlSeconds);
 
+      // Phase 9: emit SET event to dashboard SSE bus.
+      emitEvent({ type: "op:set", key, handledBy: NODE_ID, forwarded: false });
+
       // Respond to client BEFORE firing replicas -- async replication.
       const response: KVMutateResponse = { ok: true, handledBy: NODE_ID };
       res.status(200).json(response);
@@ -620,6 +649,8 @@ app.put("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunc
       const { status, data } = await forwardRequest(
         owner, "PUT", `/kv/${encodeURIComponent(key)}`, req.body
       );
+      // Phase 9: emit forwarded SET event.
+      emitEvent({ type: "op:set", key, forwarded: true, forwardedTo: owner.id });
       res.status(status).json(data);
     }
   } catch (err) {
@@ -656,6 +687,8 @@ app.get("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunc
       if (isSelf(node)) {
         const value = cache.get(key);
         if (value !== null) {
+          // Phase 9: emit GET served event.
+          emitEvent({ type: "op:get", key, handledBy: NODE_ID });
           const response: KVGetResponse = { key, value, handledBy: NODE_ID };
           return res.json(response);
         }
@@ -666,6 +699,8 @@ app.get("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextFunc
       // Forward to the peer's direct local-read endpoint (no re-routing).
       const result = await forwardRequest(node, "GET", `/internal/get/${encodeURIComponent(key)}`);
       if (result.status === 200) {
+        // Phase 9: emit GET served-by-peer event.
+        emitEvent({ type: "op:get", key, handledBy: node.id });
         return res.status(200).json(result.data);
       }
       // 404 from peer -- try next replica.
@@ -706,6 +741,43 @@ app.delete("/kv/:key", async (req: Request<KVParams>, res: Response, next: NextF
   } catch (err) {
     next(err);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Route -- SSE event stream (Phase 9 dashboard)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /events
+ *
+ * Server-Sent Events stream consumed by the dashboard aggregator.
+ * Each event is a JSON-encoded VulcanEvent on a `data:` line.
+ *
+ * Design note: This endpoint intentionally does NOT emit events for
+ * internal replica writes (PUT /internal/replicate) or dump reads
+ * (GET /internal/dump) -- those are node-to-node plumbing, not
+ * client-facing operations worth surfacing in the dashboard.
+ */
+app.get("/events", (req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.flushHeaders();
+
+  // Keepalive comment every 15 s prevents proxy / load-balancer timeouts.
+  const keepAlive = setInterval(() => { res.write(": keepalive\n\n"); }, 15_000);
+
+  const onEvent = (event: Record<string, unknown>) => {
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+
+  eventBus.on("sse", onEvent);
+
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    eventBus.off("sse", onEvent);
+  });
 });
 
 // ---------------------------------------------------------------------------
