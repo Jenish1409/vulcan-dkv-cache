@@ -1,792 +1,528 @@
-# Vulcan — Distributed Key-Value Cache
+# Vulcan -- Distributed Key-Value Cache
 
-> A portfolio project building a distributed KV cache from scratch — consistent hashing, replication, and chaos testing — one phase at a time.
+> A portfolio project building a distributed KV cache from scratch -- consistent hashing,
+> replication, chaos testing, and a live visual dashboard -- one phase at a time.
 
 ---
 
-## Phase 1 — Single-Node In-Memory Store
+## Phases at a glance
 
-### What it does
+| Phase | What was built | Status |
+|---|---|---|
+| 1 | LRU in-memory store (HashMap + DLL + TTL) | Done |
+| 2 | HTTP layer + consistent hash ring + request routing | Done |
+| 3 | Heartbeat, failure detection, ring recovery | Done |
+| 4 | Async replication, read fallback, rejoin re-sync | Done |
+| 5 | Docker containerisation (3-node compose cluster) | Done |
+| 6 | Benchmarking (Vulcan vs Redis) | Done |
+| 7/8 | Chaos testing harness + linearizability checker | Done |
+| 9 | Live visual dashboard (hash ring, event log, chaos controls) | Done |
 
-A single-process, in-memory key-value store with:
+---
+
+## Phase 1 -- LRU In-Memory Store
+
+### What is built
+
+A single-process, in-memory key-value store backed by a HashMap + doubly linked list.
 
 | Feature | Detail |
-|---------|--------|
-| **SET / GET / DELETE** | O(1) average-case via HashMap |
-| **Optional TTL** | Per-key expiry in seconds |
-| **LRU eviction** | Bounded memory with O(1) evict |
+|---|---|
+| `SET / GET / DELETE` | O(1) average via `Map<string, Node>` |
+| TTL per key | Optional expiry in seconds |
+| LRU eviction | Bounded memory; O(1) promote and evict |
+| Generic type `LRUCache<V>` | Value type enforced at compile time |
+| `destroy()` | Clears the sweep interval; prevents timer leaks in tests |
 
----
-
-### Design Decisions
-
-#### 1 — Why O(1) for everything?
-
-The backing `Map<string, Node>` gives O(1) key lookup. Reads and deletes go straight to the map with no scanning. The doubly linked list (DLL) handles recency tracking in O(1) pointer rewires.
-
-A naive "find the oldest entry" approach would be O(n) on every eviction — unacceptable at scale.
-
----
-
-#### 2 — LRU via doubly linked list + HashMap
-
-The cache maintains two data structures in sync:
+### How LRU works
 
 ```
-HashMap  →  { key: Node }         ← O(1) lookup
-DLL      →  head ↔ [MRU] ↔ … ↔ [LRU] ↔ tail   ← O(1) promote & evict
+HashMap  ->  { key: Node }                          O(1) lookup
+DLL      ->  head <-> [MRU] <-> ... <-> [LRU] <-> tail   O(1) promote and evict
 ```
 
-**Key insight:** every node in the DLL also lives in the map. So we can jump to any node by key in O(1), then rewire its `prev`/`next` pointers in O(1) to move it to the MRU position. No scanning needed.
+Every DLL node also lives in the map. Promoting a node to MRU is O(1) pointer rewiring -- no scan. Two sentinel head/tail nodes eliminate null checks at the edges.
 
-Two sentinel nodes (head, tail) are permanently planted at each end. They eliminate `null` checks on the edge cases of an empty list, and make insertion/deletion code uniform.
+**TTL strategy -- lazy expiry + active sweep (both always running):**
+- *Lazy*: every `GET` checks `Date.now() >= expiresAt`. Free on the hot path.
+- *Active sweep*: `setInterval` walks the map every N ms and purges expired entries. Prevents unbounded memory growth for cold keys never read again.
+- Timer is `.unref()`-ed so it never blocks process exit.
 
-**Operations:**
-- `GET`: look up node in map → lazy-expire check → rewire to MRU → return value
-- `SET`: if key exists, update + promote to MRU; if new, evict LRU if at cap, then insert at MRU
-- `DELETE`: look up in map, remove from map and DLL
-
----
-
-#### 3 — TTL: lazy expiry + active sweep (both, always)
-
-Two strategies run in parallel — this is how Redis does it:
-
-**Lazy expiry** (per-read)
-- Every `GET` checks `Date.now() >= node.expiresAt`.
-- If expired: delete node, return `null`.
-- Cost: one comparison per read — effectively free.
-- Problem: cold keys (written, never read) sit in memory forever.
-
-**Active sweep** (background `setInterval`)
-- Walks the entire map every N milliseconds and purges all expired entries.
-- Bounds worst-case memory growth regardless of read activity.
-- Cost: O(n) — runs infrequently (default: every 1 second).
-- Problem if used *alone*: wastes CPU even when nothing is expiring.
-
-**Why both?**
-- Lazy alone: O(1) hot path, but you can leak unbounded memory for cold keys.
-- Active alone: catches everything but burns CPU on every tick even if 0 keys expire.
-- Together: the lazy path handles the common case for free; the sweep is the safety net. This is the industry standard (Redis, Memcached, Caffeine all use this pattern).
-
-The sweep timer is `.unref()`-ed so it never prevents the Node.js process from exiting naturally.
-
----
-
-#### 4 — Generic type parameter `LRUCache<V>`
-
-The class is generic: `LRUCache<V = unknown>`. The value type is enforced at compile time so TypeScript consumers get full type safety — no `any`, no casting.
-
----
-
-#### 5 — `destroy()` for resource cleanup
-
-The sweep `setInterval` holds a reference that prevents garbage collection. Calling `destroy()` clears the interval and the map. This is critical in tests (prevents timer leaks between test cases).
-
----
-
-### File Structure
+### Files
 
 ```
-vulcan/
-├── src/
-│   └── store/
-│       ├── LRUCache.ts        ← Core implementation (DLL + HashMap + TTL)
-│       └── index.ts           ← Barrel re-export for later phases
-├── tests/
-│   └── store/
-│       └── LRUCache.test.ts   ← Jest unit tests
-├── jest.config.ts
-├── tsconfig.json
-├── package.json
-└── README.md
+src/store/LRUCache.ts          core implementation
+src/store/index.ts             barrel re-export
+tests/store/LRUCache.test.ts   Jest unit tests
 ```
 
----
-
-### Running the Tests
+### Tests and build
 
 ```bash
-# Install dependencies
 npm install
-
-# Run all tests
-npm test
-
-# Run in watch mode (re-runs on file save)
+npm test              # 27 tests (LRUCache suite)
 npm run test:watch
-
-# Run with coverage report
 npm run test:coverage
+npm run build         # tsc, zero errors
 ```
 
-Tests use **Jest fake timers** (`jest.useFakeTimers()`) so TTL expiry tests run instantly without `sleep`. No real time passes.
+Jest fake timers (`jest.useFakeTimers()`) are used so TTL tests run instantly.
 
 ---
 
-### What's deferred to later phases
+## Phase 2 -- HTTP Layer + Consistent Hashing Ring
 
-| Feature | Phase |
-|---------|-------|
-| ~~Network protocol (TCP/gRPC)~~ | ~~Phase 2~~ ✅ Done |
-| ~~Consistent hashing ring~~ | ~~Phase 2~~ ✅ Done |
-| ~~Heartbeat / failure detection~~ | ~~Phase 3~~ ✅ Done |
-| ~~Ring recovery on node failure~~ | ~~Phase 3~~ ✅ Done |
-| ~~Replication / read fallback~~ | ~~Phase 4~~ ✅ Done |
-| ~~Rejoin re-sync~~ | ~~Phase 4~~ ✅ Done |
-| ~~Docker / containerised deployment~~ | ~~Phase 5~~ ✅ Done |
-| ~~Benchmarking (Vulcan vs Redis)~~ | ~~Phase 6~~ ✅ Done |
-| Dynamic node discovery (gossip) | Phase 7+ |
-| Persistence (WAL / snapshots) | Phase 7+ |
-| Chaos testing | Phase 7+ |
-
-The `LRUCache` class is intentionally self-contained and import-friendly — the Phase 2 HTTP layer wraps it without modifying a single line.
-
----
-
-## Phase 2 — HTTP Layer + Consistent Hashing Ring
-
-### What it does
+### What is built
 
 | Feature | Detail |
-|---------|--------|
-| **REST API per node** | `PUT /kv/:key`, `GET /kv/:key`, `DELETE /kv/:key`, `GET /health` |
-| **Consistent hash ring** | SHA-256, 150 virtual nodes/physical node, O(log n) key lookup |
-| **Embedded routing** | Any node accepts any request and forwards to the correct owner |
-| **Static peer config** | `PEERS` env var — dynamic discovery is Phase 3 |
+|---|---|
+| REST API per node | `PUT /kv/:key`, `GET /kv/:key`, `DELETE /kv/:key`, `GET /health` |
+| Consistent hash ring | SHA-256 (Node.js `crypto`), 150 virtual nodes per physical node, O(log n) lookup |
+| Embedded routing | Any node accepts any request and forwards to the correct owner |
+| `GET /ring/owner/:key` | Returns the predicted owner without storing anything |
+| Static peer config | `PEERS` env var (`nodeId:host:port,...`) |
 
----
+### Why consistent hashing
 
-### Design Decisions
+With naive `hash(key) % N`, adding one node changes `N` for every key -- ~80% of keys remap. Consistent hashing places nodes and keys on a fixed circular ring; adding one node moves only ~1/(N+1) of keys. Measured: adding a 5th node to a 4-node ring remapped ~20% of 10,000 test keys.
 
-#### 1 — Why consistent hashing instead of `hash(key) % N`?
+### Why 150 virtual nodes
 
-With naive modulo hashing, adding or removing **one** node causes almost
-**all** keys to remap — because every key's modulus denominator `N` changes.
-Example: with 4 nodes → 5 nodes, `key % 4` and `key % 5` rarely agree, so
-~80% of keys move.  Cache hit rate crashes to near zero on any topology change.
+One ring point per physical node causes uneven arc sizes. 150 proxy points per node smooth the distribution. Our HashRing test verifies no single node owns more than ~40% of keys. Cassandra uses 256; 150 is a common production default.
 
-**Consistent hashing** places nodes and keys on a circular hash ring
-(0…2³²-1).  Each key is owned by the **first node clockwise** from it.
-When a node is added, only the keys in its "arc" of the ring move — typically
-`1/(N+1)` of total keys.  All other keys stay untouched.
+### Why embedded routing (not a coordinator)
 
-Our measured result: adding a 5th node to a 4-node ring remapped **~20%**
-of 10,000 test keys — exactly the theoretical expectation.  With naive
-modulo, the same operation would remap ~80%.
+A dedicated coordinator is a single point of failure. Every Vulcan node holds its own copy of `HashRing`. If it receives a request for a key it does not own, it forwards to the owner and relays the response -- transparent to the client.
 
-#### 2 — Why virtual nodes (vnodes)?
+### Files
 
-With one ring position per physical node, random SHA-256 placement can
-create highly uneven arcs.  One node might own 50% of the ring; another
-only 5%.
-
-Each physical node is assigned **150 virtual nodes** — proxy positions
-spread across the ring.  With more points, the arc sizes average out via
-the law of large numbers.  Our distribution test verifies no single node
-owns more than 40% of keys.  Cassandra uses 256 vnodes per node; 150 is
-a common production default.
-
-#### 3 — Routing: embedded in each node (not a dedicated coordinator)
-
-Every Vulcan node maintains its own copy of the `HashRing`.  When a request
-arrives for a key owned by a different node, the receiving node forwards
-the request via HTTP and relays the response.  The client sees a single
-response regardless of which node it contacted.
-
-**Why not a separate coordinator process?**
-- Coordinator = single point of failure
-- Every extra process to manage in ops
-- Phase 3 replication will make reads local anyway — the forward hop
-  disappears once any node can serve reads from a replica
-
-#### 4 — `GET /health` is forward-compatible
-
-The `HealthResponse` type in `src/server/types.ts` is designed to grow:
-Phase 3 will add `replicationLag`, `peerStatuses`; Phase 4 may add
-`vnodeCount`.  Clients can safely ignore unknown fields.
-
----
-
-### Running the Cluster
-
-#### Quick start (opens 3 terminal windows)
-
-```powershell
-.\scripts\start-cluster.ps1
+```
+src/routing/HashRing.ts           consistent hash ring
+src/server/node.ts                HTTP server + routing logic
+src/server/router.ts              forward-request helper
+src/server/types.ts               shared TypeScript types
+tests/routing/HashRing.test.ts    17 unit tests
 ```
 
-#### Manual start (PowerShell — one terminal per node)
+### Running the cluster
 
 ```powershell
-# Terminal 1 — node1
+# Three-terminal helper script
+.\scripts\start-cluster.ps1
+
+# Or manually (one terminal per node):
 $env:NODE_ID="node1"; $env:PORT="5001"; $env:PEERS="node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"; npm run start:node
-
-# Terminal 2 — node2
 $env:NODE_ID="node2"; $env:PORT="5002"; $env:PEERS="node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"; npm run start:node
-
-# Terminal 3 — node3
 $env:NODE_ID="node3"; $env:PORT="5003"; $env:PEERS="node1:localhost:5001,node2:localhost:5002,node3:localhost:5003"; npm run start:node
 ```
 
-#### Verify cross-node routing
-
 ```powershell
-# Run the automated smoke test
+# Smoke test (cross-node routing)
 .\scripts\smoke-test.ps1
 
-# Or manually:
-# Write via node1
+# Manual check
 Invoke-RestMethod -Method PUT -Uri 'http://localhost:5001/kv/hello' `
   -Body '{"value":"world"}' -ContentType 'application/json'
-
-# Read via node3 — the handledBy field shows which node actually stored it
-Invoke-RestMethod -Uri 'http://localhost:5003/kv/hello'
-# → { key: "hello", value: "world", handledBy: "node1" }  (or node2, depending on ring)
+Invoke-RestMethod 'http://localhost:5003/kv/hello'
+# -> { key: "hello", value: "world", handledBy: "node1" }
 ```
 
-#### Run all tests
+### Tests and build
 
 ```bash
-npm test          # 27 (Phase 1) + 17 (Phase 2 HashRing) = 44 tests
-npm run build     # TypeScript compiles with no errors
+npm test        # 27 (Phase 1) + 17 (HashRing) = 44 tests, 2 suites
+npm run build   # zero errors
 ```
 
 ---
 
-## Phase 3 — Heartbeat, Failure Detection & Ring Recovery
+## Phase 3 -- Heartbeat, Failure Detection, Ring Recovery
 
-### What it does
+### What is built
 
 | Feature | Detail |
 |---|---|
-| **Heartbeat** | Each node pings every peer via `GET /health` every 2 s |
-| **Failure detection** | 3 consecutive missed pings → peer marked DEAD, removed from local ring |
-| **Automatic rerouting** | Once a node is removed from the ring, its key range falls to the next clockwise node — no extra code needed, `HashRing.removeNode()` handles it |
-| **Rejoin handling** | First successful ping after DEAD → peer re-added to ring, logged clearly |
-| **Observable state** | `GET /health` now includes `clusterView` — per-peer ALIVE/DEAD status readable over HTTP |
-| **Ring owner debug** | `GET /ring/owner/:key` — returns predicted owner without storing anything |
+| Heartbeat | Each node pings every peer via `GET /health` on an interval |
+| Failure detection | 3 consecutive missed pings -> peer marked DEAD, removed from local ring |
+| Automatic rerouting | `HashRing.removeNode()` shifts the dead node's key range to the next clockwise node |
+| Rejoin detection | First successful ping after DEAD -> peer re-added to ring |
+| Observable cluster state | `GET /health` includes `clusterView`: per-peer ALIVE/DEAD status |
+| Ring owner debug endpoint | `GET /ring/owner/:key` |
 
----
-
-### Heartbeat Config Values
+### Heartbeat defaults (all env-var overridable)
 
 | Setting | Default | Rationale |
 |---|---|---|
-| `HEARTBEAT_INTERVAL_MS` | **2 000 ms** | Fast enough for ~6 s detection; slow enough not to flood peers |
-| `PING_TIMEOUT_MS` | **1 500 ms** | Shorter than interval so pings don't pile up. 500 ms slack per cycle |
-| `FAILURE_THRESHOLD` | **3 consecutive failures** | 3 × 2 s = **6 s** to declare dead. Absorbs 2 transient packet losses before acting. Production Cassandra uses ~10 s; 6 s fits a dev cluster |
+| `HEARTBEAT_INTERVAL_MS` | 2000 ms | ~6 s detection; not too chatty |
+| `PING_TIMEOUT_MS` | 1500 ms | Shorter than interval so pings don't pile up |
+| `FAILURE_THRESHOLD` | 3 | 3 x 2 s = 6 s before declaring DEAD; absorbs 2 transient losses |
 
-All three are overridable via environment variables.
+### Architecture: testable state machine
 
----
+`HeartbeatManager` separates I/O from logic:
+- `tick()` -- runs on the interval, calls `pingFn(peer)` in parallel
+- `processPingResult(nodeId, alive)` -- public, synchronous state machine
 
-### "Each node has its own local view" — what that means
+Unit tests call `processPingResult` directly with a boolean -- no HTTP servers, no timers, no mocks of axios needed.
 
-There is **no distributed consensus** on cluster membership. Each node runs its own heartbeat loop independently and maintains its own copy of the ring.
+### "Local view" -- no distributed consensus
 
-**Convergence window**: if node1 detects node2 dead 2 s before node3 does, during that ~2 s window they briefly disagree on ring topology. The worst case is one forwarded request bounces off the dead node and returns a 502 — the client retries and succeeds once all nodes converge.
+Each node runs its heartbeat independently. During the ~2 s convergence window after a failure, two nodes may briefly disagree on topology. Worst case: one 502 that the client retries. Raft/Paxos would eliminate this window but is out of scope here.
 
-**Why this is acceptable at this stage**: Forcing agreement would require Raft or Paxos — a significant complexity jump that belongs in a later phase. The window is bounded to ≤ 1 heartbeat interval and resolves automatically. This is the same trade-off production gossip protocols (Cassandra, Consul) make — they call it *eventual consistency of cluster membership*.
+### Files
 
----
+```
+src/server/HeartbeatManager.ts          heartbeat + failure detection
+tests/server/HeartbeatManager.test.ts   19 unit tests
+scripts/failure-test.ps1                live demo script
+```
 
-### Architecture: `processPingResult` as the testable unit
-
-`HeartbeatManager` separates network I/O from state-machine logic:
-- `tick()` — runs on the interval, calls `pingFn(peer)` in parallel
-- `processPingResult(nodeId, alive)` — **public, synchronous** state machine; takes a pre-computed boolean
-
-This means unit tests call `processPingResult` directly — no HTTP servers, no fake timers, no mocks of axios. The `pingFn` is injected and replaced with a stub in tests.
-
----
-
-### Running the failure demo
+### Failure demo
 
 ```powershell
-# Self-contained — starts its own cluster, runs all 12 steps, cleans up
 .\scripts\failure-test.ps1
 ```
 
-What it proves (with real terminal output):
+Proves (with real output):
 1. All 3 nodes start ALIVE
-2. Keys are discovered on node2 using `GET /ring/owner/:key` (no guessing)
-3. Those keys are written and confirmed `handledBy: node2`
-4. node2 is killed
-5. After ~6 s: node1 and node3 both show node2 as `DEAD` in `/health`
-6. The same keys return `404` — **data is gone, as expected** (no replication yet)
-7. Writing those keys again routes them to node1/node3 — **rerouting confirmed**
-8. node2 is restarted; after ~6 s both surviving nodes show it `ALIVE` again
-9. node2 rejoins empty — data written during the outage stays on node1/node3
+2. Keys are written to node2 (confirmed via `GET /ring/owner/:key`)
+3. node2 is killed
+4. After ~6 s: node1 and node3 both show node2 DEAD in `/health`
+5. Those keys now return 404 (no replication yet -- expected)
+6. New writes to the same keys route to node1/node3 (rerouting confirmed)
+7. node2 restarts; after ~6 s both surviving nodes show it ALIVE again
 
-#### Live results from an actual run
-
-```
-Ring ownership (100 keys via /ring/owner/:key):
-  node1: 36  |  node2: 29  |  node3: 35
-
-After killing node2 and waiting 10s:
-  port 5001 sees node2 as: DEAD  (consecutiveFailures=8)
-  port 5003 sees node2 as: DEAD  (consecutiveFailures=8)
-
-Data on dead node (404 as expected):
-  probe-key-0, probe-key-1, probe-key-5, probe-key-6, probe-key-9 -> all 404
-
-New writes rerouted:
-  probe-key-0 -> node1  |  probe-key-1 -> node3
-  probe-key-5 -> node3  |  probe-key-6 -> node1  |  probe-key-9 -> node3
-
-After restarting node2:
-  port 5001 sees node2 as: ALIVE
-  port 5003 sees node2 as: ALIVE
-
-Results: 35 passed, 0 failed
-```
-
-#### Run all tests
+### Tests and build
 
 ```bash
-npm test          # 44 (Phase 1+2) + 19 (Phase 3) = 63 tests
-npm run build     # TypeScript compiles with no errors
+npm test        # 44 (Phase 1+2) + 19 (HeartbeatManager) = 63 tests, 3 suites
+npm run build   # zero errors
 ```
 
 ---
 
-### What's deferred to Phase 4+
+## Phase 4 -- Async Replication, Read Fallback, Rejoin Re-sync
 
-| Feature | Why deferred |
-|---|---|
-| Data recovery on rejoin | node2 comes back empty -- requires replication to restore its key range |
-| Keys migrated back to node2 | Needs gossip / data migration |
-| Consensus on cluster membership | Raft/Paxos -- out of scope for Phase 3 |
-| Docker / chaos harness | Phase 5+ |
-
----
-
-## Phase 4 -- Replication, Read Fallback & Rejoin Re-sync
-
-### What it does
+### What is built
 
 | Feature | Detail |
 |---|---|
-| **Replication factor** | Configurable `REPLICATION_FACTOR` (default: 2). Each key lives on 1 primary + 1 replica. |
-| **Replica placement** | `HashRing.getReplicaNodes(key, RF)` walks clockwise from primary, collecting N **distinct** physical nodes. Never picks the same physical node twice via a different virtual-node position. |
-| **Async write replication** | Primary writes locally, returns 200 to client, fires replica writes in background (fire-and-forget). Client latency is unaffected by replica write time. |
-| **Read fallback** | If the primary is DEAD, the reader falls back to the next live replica in order. Uses `fullRing` (stable, never modified) for replica placement and heartbeat status for liveness. |
-| **Rejoin re-sync** | When a dead node comes back ALIVE, surviving nodes push the relevant key-value pairs back to it. Entries are **filtered** before sending -- only keys where `fullRing.getReplicaNodes(key, RF).includes(rejoinedNodeId)` are pushed. |
-| **Two-ring architecture** | `ring` (modified by heartbeat) for live routing. `fullRing` (read-only, all peers) for stable replica placement. |
+| Replication factor | `REPLICATION_FACTOR` env var, default 2. Each key lives on 1 primary + N-1 replicas. |
+| Replica placement | `HashRing.getReplicaNodes(key, RF)` walks clockwise from primary, collecting distinct physical nodes |
+| Async write replication | Primary writes locally, returns 200, fans out to replicas in background |
+| `GET /ring/replicas/:key` | Returns full replica list for a key |
+| Read fallback | If primary is DEAD, reader falls back to the next live replica |
+| Two-ring architecture | `ring` (modified by heartbeat) for live routing; `fullRing` (all peers, read-only) for replica placement |
+| Rejoin re-sync | When a dead node rejoins, surviving nodes push back only the keys that node is responsible for |
+| Internal endpoints | `PUT /internal/replicate/:key`, `GET /internal/get/:key`, `GET /internal/dump` |
 
----
+### Why two rings
 
-### Consistency model: Asynchronous replication
+After a node dies, `ring.removeNode()` removes it -- so `ring.getReplicaNodes()` can no longer return it. But read fallback needs to know who *was* holding the replica. `fullRing` (never modified) preserves that information.
 
-**What it is**: The primary writes locally, responds to the client with 200, then fires writes to replica nodes in the background. The client never waits for replicas to acknowledge.
+### Consistency model: async replication
 
-**Why this choice**: It minimises write latency and is simple to implement correctly. For a portfolio project demonstrating distributed systems concepts, this is the right starting point.
+Primary writes locally, responds to client, then fans out to replicas in the background. Trade-off: if the primary crashes after responding but before a replica write completes, that write is permanently lost. A sync mode (wait for at least one replica ack before responding) eliminates this at the cost of write latency -- not implemented here, noted as future work.
 
-**The durability risk**: If the primary crashes in the tiny window *after* returning 200 to the client but *before* the background replica write completes, that write is permanently lost -- neither the primary (dead) nor the replica (never received it) has the data.
+### Rejoin re-sync filtering
 
-**What a real system would do**: Offer a configurable `SYNC` mode: the primary waits for at least W replica acknowledgements before responding (W=1 means "at least one replica confirmed"). This eliminates the durability gap at the cost of added latency proportional to the slowest replica in your write quorum. Cassandra, DynamoDB, and Riak all expose this as a tunable `consistency_level` / `WriteConcern`.
-
-**Interview explanation**: "We chose async replication because it keeps write latency identical to a single-node store. The trade-off is a small durability window between the primary's response and the replica commit. In production I'd add a sync mode with quorum writes for critical data -- the `REPLICATION_FACTOR` and `W` (write quorum) are already the natural configuration knobs for that."
-
----
-
-### Two-ring architecture: why it exists
-
-After a node dies, `HeartbeatManager` calls `ring.removeNode(deadNodeId)`. The dead node no longer exists in `ring`, so `ring.getReplicaNodes(key, RF)` can no longer return it.
-
-But to serve a read fallback we need to know: *who was holding the replica before the primary died?* That requires the **original** consistent-hashing assignment, which includes the dead node's virtual positions.
-
-Solution: maintain a **second ring** (`fullRing`) seeded from all configured peers and never modified. Rules:
-- `ring` -- used for routing new writes to live nodes only.
-- `fullRing` -- used for replica placement (read fallback, re-sync filtering). Read-only.
-
----
-
-### Rejoin re-sync filtering (correctness invariant)
-
-When node2 rejoins, surviving nodes collect dumps from all live peers and their own caches. A peer's dump contains keys for **many different** primary/replica assignments -- not just node2's range.
-
-Before pushing anything to node2, each entry is filtered:
+When node2 rejoins, surviving nodes filter their entire cache dump:
 
 ```typescript
 const owners = fullRing.getReplicaNodes(key, REPLICATION_FACTOR);
 if (owners.includes(rejoinedNodeId)) {
-  // only push this key to the rejoining node
+  // only push this key
 }
 ```
 
-This prevents node2 from receiving keys it is not responsible for, which would corrupt the ownership model.
+Prevents node2 from receiving keys it is not responsible for.
 
-The filtering is **observable** in the logs:
+### Files
+
 ```
-[node1] RESYNC: 12/38 keys filtered for "node2" (26 skipped -- not in replica list)
-[node1] RESYNC complete for "node2": 12 pushed, 0 failed
+src/server/node.ts            replication + fallback + re-sync logic (in same file as Phase 2/3)
+scripts/replication-test.ps1  live demo script
 ```
 
----
-
-### Running the replication demo
+### Replication demo
 
 ```powershell
-# Self-contained -- starts its own cluster, runs all 8 steps, cleans up
 .\scripts\replication-test.ps1
 ```
 
-What it proves:
-1. Cluster starts with RF=2
-2. A key is written to node2 (primary) and confirmed on node1 (replica)
-3. node2 is killed
-4. `GET key` still returns the correct value, served by node1 (replica)
-5. This is **meaningfully different from Phase 3** -- Phase 3 returned 404
-6. New writes to node2's range route to surviving nodes
-7. node2 restarts, re-sync runs
-8. node2 has the key back
+Proves:
+1. Key written to node2 (primary), confirmed on node1 (replica)
+2. node2 killed
+3. `GET key` returns correct value served by node1 (replica) -- not 404 as in Phase 3
+4. node2 restarts; re-sync pushes the key back to node2
 
-#### Live results from an actual run
-
-```
-Step 2 -- key='repl-key-0'  primary=node2  replica=node1
-
-Step 3 -- replication confirmed:
-  PUT handledBy: node2
-  Replica node1 has value='phase4-value' via /internal/get  [PASS]
-
-Step 4 -- node2 killed. Heartbeat detects DEAD after 10s.
-
-Step 5 -- THE MONEY SHOT:
-  GET value='phase4-value'  handledBy=node1  [PASS]
-  (Phase 3 would have returned 404 here)
-
-Step 8 -- re-sync:
-  node2 has 'repl-key-0' back after re-sync  [PASS]
-  node1 sees node2 as ALIVE  [PASS]
-
-Results: 13 passed, 0 failed
-```
-
-#### Run all tests
+### Tests and build
 
 ```bash
-npm test          # 63 (Phase 1-3) + 13 (Phase 4 getReplicaNodes) = 76 tests
-npm run build     # TypeScript compiles with no errors
+npm test        # 76 tests total, 3 suites (getReplicaNodes tests are in HashRing suite)
+npm run build   # zero errors
 ```
 
 ---
 
-### What's deferred to Phase 6+
+## Phase 5 -- Docker Containerisation
 
-| Feature | Why deferred |
-|---|---|
-| Delete replication | Replicas serve stale data after a delete until re-sync. Full delete fan-out deferred. |
-| Incremental / range-scoped re-sync | Full dump is naive for large caches. Phase 6 can scope by key range. |
-| Read quorum (R > 1) | Currently reads from first live replica. A quorum read provides stronger consistency. |
-| Dynamic node discovery (gossip) | Phase 6+ |
-| Persistence (WAL / snapshots) | Phase 6+ |
-| Chaos testing harness | Phase 7+ |
+### What is built
 
----
+A three-node Docker Compose cluster. Each node runs in its own container on an isolated bridge network.
 
-## Phase 5 -- Docker Deployment
+```yaml
+# docker-compose.yml -- 3 services: node1, node2, node3
+# Each uses the same Dockerfile, different NODE_ID/PORT/PEERS
+# Host port mapping: 5001:5001, 5002:5002, 5003:5003
+```
+
+Multi-stage Dockerfile:
+- *Builder stage*: installs all dev dependencies, compiles `src/` to `dist/`
+- *Runtime stage*: installs production dependencies only, copies `dist/`, runs as non-root user `vulcan` (UID 1001)
 
 ### Quick start
 
 ```powershell
-# Build images and start the 3-node cluster
-docker compose up --build -d
-
-# Check all 3 containers are healthy
-docker compose ps
-
-# Stream logs from one node
-docker compose logs -f node1
-
-# Tear down
-docker compose down
+docker compose up --build -d   # build images + start cluster
+docker compose ps              # verify all 3 containers healthy
+docker compose logs -f node1   # stream logs
+docker compose down            # tear down
 ```
 
-### Run test scripts against the Docker cluster
+### Running test scripts against Docker
 
 ```powershell
-# smoke-test.ps1 works with zero changes (talks to localhost:5001/5002/5003)
-.\scripts\smoke-test.ps1
-
-# failure-test.ps1: -UseDocker skips Start-Job, uses docker compose stop/start
-.\scripts\failure-test.ps1 -UseDocker
-
-# replication-test.ps1: same -UseDocker pattern
+.\scripts\smoke-test.ps1                      # talks to localhost:5001/5002/5003
+.\scripts\failure-test.ps1 -UseDocker         # uses docker compose stop/start
 .\scripts\replication-test.ps1 -UseDocker
 ```
 
-Phase 5 verified results (against live Docker cluster):
+Verified results:
 
 | Script | Result |
 |---|---|
-| smoke-test.ps1 | 5/5 PASS (zero changes required) |
+| smoke-test.ps1 | 5/5 PASS |
 | failure-test.ps1 -UseDocker | 35/35 PASS |
 | replication-test.ps1 -UseDocker | 15/15 PASS |
 
-### Container networking: how PEERS works inside Docker
+### Container networking
 
-Outside Docker, nodes reach each other via `localhost:500N`. Inside Docker each
-container has its own network namespace -- `localhost` inside the container refers
-to that container only, not its peers.
-
-Docker Compose creates a shared bridge network and makes each service's name a
-resolvable DNS hostname within that network. The `PEERS` env var therefore uses
-Docker service names as the host field:
+Inside Docker, `localhost` refers to the container itself -- not peers. Compose creates a shared bridge network and makes each service name a DNS hostname:
 
 ```
 PEERS=node1:node1:5001,node2:node2:5002,node3:node3:5003
-       ^^^^^ nodeId  ^^^^^ Docker DNS hostname  ^^^^^ port
+       ^^^^^         ^^^^^ Docker DNS hostname
+       nodeId
 ```
 
-Heartbeat pings, replica fan-out, and rejoin re-sync dump fetches are all
-container-to-container calls that use these service-name addresses.
-
-Host-side (`localhost:5001/5002/5003`) is handled by Docker port mapping:
-`ports: 5001:5001` forwards host traffic to the matching container. The
-existing test scripts run on the host and therefore need no changes at all.
-
-### Why multi-stage build?
-
-The builder stage installs all 396 packages (including TypeScript, ts-node, Jest)
-and compiles `src/` to `dist/`. The runtime stage starts fresh and installs only
-the 81 production packages (express, axios). This:
-
-- Keeps the final image lean (no TypeScript compiler, no test runner shipped).
-- Prevents accidental source-code leakage into the container.
-- Means layer cache invalidation on source changes only rebuilds the compile step,
-  not the much-slower full npm ci.
-
-### Why non-root user?
-
-The runtime stage creates a dedicated `vulcan` user (UID 1001) and runs the
-Node process under that account. Two reasons worth knowing:
-
-1. **Blast-radius containment**: if an attacker exploits the Node process and
-   escapes the container, a root container grants host-root access to the kernel
-   surface. A non-root user limits what they can do even if they escape.
-2. **Production compliance**: GKE, ECS, and most enterprise Kubernetes policies
-   enforce `runAsNonRoot` by default. Building this habit costs nothing.
-
-### What's deferred to Phase 6+
-
-- Multi-machine deployment (requires an orchestrator or bare-metal provisioning).
-- Docker Swarm / Kubernetes manifests.
-- Named volumes / persistence per container.
-- Centralised log aggregation (e.g. Loki, CloudWatch).
-- Per-container CPU/memory resource limits.
+Host-to-container traffic (test scripts) uses the `ports: 5001:5001` mappings -- no script changes needed.
 
 ---
 
 ## Phase 6 -- Benchmarking (Vulcan vs Redis)
 
-Full results, raw data, and honest analysis in [`benchmarks/README.md`](./benchmarks/README.md).
+Full results and raw data: [`benchmarks/README.md`](./benchmarks/README.md)
+
+**Environment:** Windows 11, Docker Desktop (WSL2), Node.js v22.19.0
 
 ### Headline numbers
 
-**Environment:** Docker Desktop (WSL2), Node.js v22.19.0, autocannon v8, redis npm client v4.
-
-| Scenario | Vulcan (3-node, RF=2) | Redis (Node client) | Redis (native ceiling) |
+| Scenario | Vulcan (3-node, RF=2) | Redis (Node client) | Redis (redis-benchmark ceiling) |
 |---|---|---|---|
-| GET throughput (c=50) | **2,193 req/s** | 14,162 ops/s | 167,504 ops/s |
-| PUT/SET throughput (c=50) | **1,119 req/s** | 13,854 ops/s | 158,228 ops/s |
-| Mixed 80/20 (c=50) | **1,942 req/s** | 13,556 ops/s | ~160,000 ops/s |
-| GET p50 / p99 (c=10) | **4 ms / 11 ms** | 0.74 ms / 2.55 ms | 0.15 ms / 0.44 ms |
+| GET throughput (c=50, 10s) | **2,193 req/s** | 14,162 ops/s | 167,504 ops/s |
+| PUT throughput (c=50, 10s) | **1,119 req/s** | 13,854 ops/s | 158,228 ops/s |
+| Mixed 80/20 (c=50, 10s) | **1,942 req/s** | 13,556 ops/s | ~160,000 ops/s |
+| GET p50 / p99 (c=10, 30s) | **4 ms / 11 ms** | 0.74 ms / 2.55 ms | 0.15 ms / 0.44 ms |
 
-### Forwarding-hop delta
+### Forwarding-hop cost
 
-Only variable: whether the key is owned by the node being hit, or must proxy to a peer.
-
-| | req/s | p50 | p99 |
+| Scenario | req/s | p50 | p99 |
 |---|---|---|---|
-| Local GET (no hop) | 4,959 | 1 ms | 5 ms |
-| Forwarded GET (proxy to node2) | 1,526 | 6 ms | 13 ms |
-| **Hop cost** | **3.25× slower** | **+5 ms** | **+8 ms** |
+| Local GET (node1 owns key) | 4,959 | 1 ms | 5 ms |
+| Forwarded GET (node2 owns key, node1 proxies) | 1,526 | 6 ms | 13 ms |
+| Delta | 3.25x slower | +5 ms | +8 ms |
 
-### Why the gap exists (short version)
+### Why the gap exists
 
-1. **HTTP/JSON vs RESP binary** -- headers, JSON parse/stringify, Express middleware (~5-10× alone)
-2. **Node.js vs C** -- V8 GC pauses visible in p99 tails (~2-3× on top)
-3. **Cross-node forwarding** -- doubles HTTP overhead per proxied request (measured: 3.25× throughput reduction, +5ms p50)
-4. **Async replication** -- PUT fan-out adds background pressure; PUT p99 (112ms) is 2× GET p99 (56ms)
+1. HTTP/JSON vs Redis RESP binary protocol -- headers, parse/stringify, Express middleware
+2. Node.js (V8 GC pauses) vs Redis (C, no GC)
+3. Cross-node forwarding -- doubles HTTP overhead per proxied request
+4. Async replication fan-out -- PUT p99 (112 ms) is ~2x GET p99 (56 ms)
 
-### Run benchmarks yourself
+### Run benchmarks
+
+```powershell
+docker compose up -d
+.\scripts\run-benchmarks.ps1   # results saved to benchmarks/raw/
+```
+
+---
+
+## Phase 7/8 -- Chaos Testing Harness
+
+A standalone tool (`chaos/`) that runs continuous load against the live cluster,
+injects failure scenarios, and checks every response for linearizability violations.
+
+### What is built
+
+| Component | File | Description |
+|---|---|---|
+| Load generator | `chaos/src/loader.ts` | 5 workers, configurable req/s, 40% SET / 60% GET |
+| Fault injector | `chaos/src/injector.ts` | Node kill (`docker compose stop`), network isolation (`docker network disconnect`), malformed value injection |
+| Flight recorder | `chaos/src/recorder.ts` | Synchronous JSONL log, one entry per operation |
+| Linearizability checker | `chaos/src/checker.ts` | Detects INVENTED_VALUE and FUTURE_READ violations |
+| Runner | `chaos/src/runner.ts` | Orchestrates all of the above |
+
+### Fault sequence (fixed in the harness)
+
+```
+T+0-15s    Baseline -- normal ops, building write history
+T+15-45s   Kill node2 (30s down)
+T+45-75s   node2 rejoin + re-sync window
+T+75-95s   Isolate node1 from Docker network (20s)
+T+95-115s  Restore node1, reconverge
+T+115-120s Malformed value injection (expects 400 rejection)
+T+120-180s Final baseline
+```
+
+### Findings (5 runs across Phase 7 and Phase 8)
+
+**Bug found and fixed (Run 1):** Express's default 100 KB body-parser limit rejected the 1 MB malformed-value test payload before our validator ran, returning 500. Fixed: `express.json({ limit: '2mb' })`. All subsequent runs correctly returned 400.
+
+**Two Generals Problem -- observed in every run (5/5):**
+
+A write that appeared to fail (HTTP timeout during the isolation window) was actually committed on the primary. After reconnection, the primary served this "phantom" value to subsequent GETs. The linearizability checker detected these as INVENTED_VALUE violations.
+
+This is a fundamental property of single-round-trip HTTP writes without distributed coordination. It is not a Vulcan implementation bug. Every AP-model store without 2PC/Raft/Paxos has this window.
+
+| Run | Duration | Rate | Ops | INVENTED_VALUE | FUTURE_READ | Stale reads |
+|---|---|---|---|---|---|---|
+| 1 (Ph.7) | 180s | 20/s | ~2,900 | 9 | 0 | 61 |
+| 2 (Ph.7) | 180s | 20/s | ~2,900 | 14 | 0 | 65 |
+| A (Ph.8) | 300s | 20/s | ~4,800 | 34 | 0 | 110 |
+| B (Ph.8) | 180s | 40/s | ~5,800 | 35 | 0 | 288 |
+| C (Ph.8) | 180s | 20/s | ~2,900 | 31 | 0 | 162 |
+
+Higher load (40 req/s) produced ~2.5x more violations for the same duration -- more concurrent writes in-flight during the fault window. No new violation category appeared at any load level.
+
+Full evidence and analysis: [`chaos/RESULTS.md`](chaos/RESULTS.md)
+
+### Run it
 
 ```powershell
 # Cluster must be running first
 docker compose up -d
 
-# One-command full benchmark suite (autocannon + redis npm + redis-benchmark)
-.\scripts\run-benchmarks.ps1
+# Default run (180s, 20 req/s, 50 keys)
+.\scripts\run-chaos.ps1
 
-# Results saved to benchmarks/raw/ (JSON + txt)
+# Custom run
+.\scripts\run-chaos.ps1 -DurationSec 300 -RatePerSec 30 -KeyCount 100
+
+# Re-analyze a saved log without re-running
+.\chaos\node_modules\.bin\ts-node.cmd chaos/src/checker.ts chaos/logs/chaos-TIMESTAMP.jsonl
 ```
 
-### What's deferred to Phase 7+
-
-- ~~Chaos testing harness~~ ✅ **Phase 7 complete — see below**
-- Benchmark with RF=1 disabled to isolate replication overhead precisely
-- Performance tuning (msgpack, multi-core Node.js cluster, HTTP/2) -- no code changes in Phase 6 per spec
+> **Windows note:** `run-chaos.ps1` invokes ts-node via the local `.cmd` shim
+> (`chaos\node_modules\.bin\ts-node.cmd`) rather than `npx ts-node`. This avoids
+> a Windows `npx.ps1` bug where the leading character is stripped from the
+> package name (`ts-node` becomes `px`), causing "could not determine executable
+> to run".
 
 ---
 
-## Phase 7 — Chaos Testing Harness
+## Phase 9 -- Live Visual Dashboard
 
-A separate tool (`chaos/`) that runs continuous load against the live cluster,
-injects failure scenarios, and checks every response for consistency violations.
+A browser dashboard that visualises the Vulcan cluster in real time: hash ring,
+live traffic, node health, and chaos injection controls.
 
-### What it does
-
-| Component | Description |
-|---|---|
-| **Load generator** | 5 workers × 20 req/s, 40% SET / 60% GET, randomised key pool |
-| **Fault injector** | Node kill (`docker compose stop`), network isolation (`docker network disconnect`), malformed value injection |
-| **Flight recorder** | Synchronous JSONL log — crash-safe, one entry per operation |
-| **Linearizability checker** | Self-validates, checks INVENTED\_VALUE and FUTURE\_READ hard invariants |
-
-### Fault scenario sequence
+### What is built
 
 ```
-T+0–15s    Baseline
-T+15–45s   Kill node2 (30s down)
-T+45–75s   node2 rejoin + re-sync window
-T+75–95s   Isolate node1 from Docker network (20s)
-T+95–115s  Restore node1, reconverge
-T+115–120s Malformed value injection (expects 400)
-T+120–180s Final baseline
+dashboard/
+  server/index.ts        aggregator -- SSE consumer + WebSocket broadcaster + chaos REST API
+  src/App.tsx            root component
+  src/components/
+    HashRing.tsx         SVG ring with animated packet ripples
+    EventLog.tsx         rolling last-20 events, colour-coded by type
+    StatsBar.tsx         node health count, op totals, replication failure count
+    ChaosControls.tsx    inject/restore buttons with per-node failure-mode tracking
+  src/hooks/
+    useVulcanEvents.ts   WebSocket connection + state management
+  src/types.ts           shared TypeScript types
 ```
-
-### Key findings (Phases 7 + 8 combined — 5 total runs)
-
-**Malformed value bug found and fixed (Run 1):** Express's default 100 KB
-body-parser limit intercepted the 1 MB test request before our validator ran,
-returning a confusing 500. Fixed: `express.json({ limit: '2mb' })`.
-Confirmed correct (400) in all subsequent runs.
-
-**Two Generals Problem — reproduced in every run (5/5):**
-
-> A write that appeared to fail (HTTP timeout during network isolation)
-> was actually committed on the primary node. After reconnection, the
-> primary served this "phantom" value to subsequent GETs.
-
-This is a **fundamental limitation of single-round-trip HTTP writes without
-distributed coordination** — not a Vulcan implementation bug.
-Every AP-model KV store without 2PC/Raft/Paxos has this window.
-The linearizability checker correctly detected each occurrence as INVENTED\_VALUE.
-
-| Run | Dur | Rate | Ops | INVENTED\_VALUE | FUTURE\_READ | Stale | Malformed |
-|---|---|---|---|---|---|---|---|
-| 1 (Ph.7) | 180s | 20/s | ~2,900 | **9** | 0 | 61 | [500 bug] |
-| 2 (Ph.7) | 180s | 20/s | ~2,900 | **14** | 0 | 65 | 400 OK |
-| A (Ph.8) | 300s | 20/s | ~4,800 | **34** | 0 | 110 | 400 OK |
-| B (Ph.8) | 180s | 40/s | ~5,800 | **35** | 0 | 288 | 400 OK |
-| C (Ph.8) | 180s | 20/s | ~2,900 | **31** | 0 | 162 | 400 OK |
-
-Higher load (40 req/s) increased violation count ≈2.5× for the same duration —
-more concurrent writes land during the fault window, generating more phantom
-commits. No new violation category appeared at any load level.
-
-Full evidence, three-phase anatomy, and reproducibility analysis: [`chaos/RESULTS.md`](chaos/RESULTS.md)
-
-### Run it
-
-```powershell
-docker compose up -d
-.\scripts\run-chaos.ps1                      # default: 3 min, 20 req/s
-.\scripts\run-chaos.ps1 -DurationSec 300     # longer run
-
-# Re-analyze saved log without re-running:
-npx --prefix chaos ts-node chaos/src/checker.ts chaos/logs/chaos-TIMESTAMP.jsonl
-```
-
-### What's deferred to Phase 9
-
-- Visual dashboard for live chaos run monitoring
-- Idempotency keys (Option C) — client-side protocol change, legitimate future work
-
-
----
-
-## Phase 9 — Live Visual Dashboard
-
-A real-time browser dashboard that visualises the Vulcan cluster as it runs —
-hash ring, live traffic, and chaos events happening in front of you.
 
 ### Architecture
 
 ```
-Vulcan nodes (5001-5003)             dashboard/
-  node.ts + SSE /events ──SSE──>  server/index.ts (port 4000)
-                                    merges 3 streams → WS broadcast
-                                    POST /chaos/* → docker commands
-                                         │ ws://localhost:4000
-                                    React/Vite UI (port 5173)
-                                    HashRing SVG | EventLog
-                                    StatsBar     | ChaosControls
+Vulcan nodes (5001-5003)
+  GET /events (SSE)  ------>  dashboard/server/index.ts  (port 4000)
+                              merges 3 SSE streams
+                              broadcasts to browser via WebSocket
+                              executes docker commands for POST /chaos/*
+                                    |
+                              ws://localhost:4000
+                                    |
+                              React/Vite UI  (port 5173)
 ```
 
-**SSE (node → aggregator):** One-directional, plain HTTP, reuses Express.
-Zero latency cost on the write/read hot path — emits are in-memory function calls.
+**SSE (node -> aggregator):** The `/events` route on each Vulcan node emits
+a Server-Sent Event for every SET, GET, replication attempt, and heartbeat.
+Zero cost on the hot path -- emits are in-memory EventEmitter calls.
 
-**WebSocket (aggregator → browser):** Bidirectional, so the browser can also
-send chaos commands back to the aggregator.
+**WebSocket (aggregator -> browser):** The aggregator merges all three SSE
+streams and broadcasts every event to connected browsers. Also exposes a
+REST API for chaos commands.
 
 ### How to run
 
-**Prerequisites:** Docker cluster must be running first.
-
 ```powershell
-# Terminal 1 — start the cluster (already running if you used Phase 7/8)
+# Terminal 1
 docker compose up -d
 
-# Terminal 2 — start the aggregator
+# Terminal 2 -- aggregator
 cd dashboard
-npm install          # first time only
-npm run server       # npx tsx server/index.ts  →  ws://localhost:4000
+npm install       # first time only
+npm run server    # tsx server/index.ts -> ws://localhost:4000
 
-# Terminal 3 — start the frontend
+# Terminal 3 -- frontend
 cd dashboard
-npm run dev          # Vite dev server  →  http://localhost:5173
+npm run dev       # Vite -> http://localhost:5173
 ```
 
-Open **http://localhost:5173** in your browser. The hash ring, live event log,
-and stats bar populate immediately as requests flow through the cluster.
+Open **http://localhost:5173**.
 
-### Dashboard features
+### Dashboard panels
 
 | Panel | What it shows |
 |---|---|
-| **Hash ring (SVG)** | 3 nodes at 120° intervals; green glow = ALIVE, red = DEAD; packet ripples on each op |
-| **Stats bar** | `N/3 nodes healthy · RF: 2 · Total ops · SETs · GETs` |
-| **Event log** | Rolling last-20 events; colour-coded by type (SET/GET/REPL/HB) |
-| **Chaos controls** | Kill node2/3, Isolate node1/2, Restore All — each button stays disabled until the docker command actually completes |
+| Hash ring (SVG) | 3 nodes at 120-degree intervals; green = ALIVE, red = DEAD; animated packet ripples per operation |
+| Stats bar | Healthy node count, RF, total ops, SET count, GET count, replication failure count |
+| Event log | Rolling last-20 events; colour-coded: SET (blue), GET (green), REPL (orange), HB (grey) |
+| Chaos controls | Kill/Isolate/Restore buttons |
 
-### Chaos buttons
+### Chaos controls -- per-node failure tracking
 
-Buttons call `POST /chaos/*` on the aggregator (runs on your host, has docker
-access). **Buttons are disabled until the aggregator confirms the docker
-command completed** — not a fixed timer — to prevent overlapping commands.
+The aggregator tracks which failure mode was applied to each node (`killed` or `isolated`).
+When a node is in a failed state, targeted fix buttons appear automatically:
 
-Conflict-state handling:
-- *Isolate an already-stopped node* → non-destructive warning, no state corruption
-- *Restore all when nothing is down* → treated as no-ops, returns success
-- *Kill an already-isolated node* → `docker stop` succeeds normally
+- Node was **killed** (container stopped) -> "Revive nodeX" button (red `killed` pill)
+- Node was **isolated** (network disconnected) -> "Reconnect nodeX" button (orange `isolated` pill)
+- **Restore All** reads the tracked state and applies the correct fix per node
 
-Known limitation: two concurrent browser tabs can race. Fine for single-user
-demo use.
+**Chaos buttons are disabled until the aggregator confirms the docker command completed** -- not a fixed timer -- to prevent double-firing.
 
-### Generating a demo GIF / video
+**Docker Desktop / Windows isolation behaviour (confirmed empirically):**
+`docker network disconnect` drops the container's host port binding, not just the inter-container path. `docker network connect` and `docker compose restart` do not restore it. Only `docker compose up -d <service>` (which recreates the container) restores both network membership and the host port binding. The aggregator uses `docker compose up -d` for both kill recovery and isolation recovery.
 
-1. Start the cluster + aggregator + Vite dev server (see above)
+### Generating a demo video
+
+1. `docker compose up -d` + `npm run server` + `npm run dev`
 2. Open http://localhost:5173
-3. Click **Kill node2** → watch node2 turn red on the ring within ~6s
-4. Click **Restore All** → watch node2 turn green, rejoin re-sync event appears
-5. Run `.\scripts\run-chaos.ps1` in a 4th terminal — watch the ring pulse with
-   live traffic and the event log stream in real time
-6. Screen-record the browser window; trim to 2–3 min
+3. Click **Kill node2** -- node2 turns red within ~6 s
+4. Click **Restore All** -- node2 turns green, re-sync event appears in log
+5. Run `.\scripts\run-chaos.ps1` in a 4th terminal -- ring pulses with live traffic
+6. Screen-record the browser window; trim to 2-3 min
 
-> 📸 _Screenshot / GIF placeholder — add after recording_
-
+> Screenshot / GIF placeholder -- add after recording
